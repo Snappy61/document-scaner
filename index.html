@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+<title>Wand Scan</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:#000;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",Helvetica,Arial,sans-serif;overscroll-behavior:none;touch-action:manipulation}
+.screen{position:fixed;inset:0;display:none}
+.screen.on{display:block}
+#intro{padding:max(24px,env(safe-area-inset-top)) 22px 24px;overflow:auto;background:#101114}
+#intro h1{margin:8px 0 4px;font-size:30px}
+#intro p,#intro li{color:#b9bcc4;line-height:1.45;font-size:15px}
+#intro ul{padding-left:20px;margin:10px 0 18px}
+#intro label{display:flex;align-items:center;gap:10px;margin:14px 0;font-size:15px;color:#e6e8ee}
+#intro input{width:80px;font-size:18px;padding:8px 10px;border-radius:10px;border:1px solid #3a3d46;background:#1b1d23;color:#fff}
+button{font:inherit;color:#fff;border:0;border-radius:14px;padding:14px 18px;background:#2b2e36;font-weight:600;font-size:16px}
+button:active{transform:scale(.97)}
+button.big{width:100%;background:#0a84ff;font-size:18px;padding:16px}
+button.go{background:#34c759;color:#04210d}
+button.warn{background:#3a2326;color:#ff8a80}
+button[hidden]{display:none}
+#v{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000}
+.hud{position:absolute;left:0;right:0;top:0;padding:max(12px,env(safe-area-inset-top)) 14px 10px;display:flex;gap:14px;align-items:center;background:linear-gradient(#000a,#0000)}
+#ring{flex:none;width:74px;height:74px;border-radius:50%;border:9px solid #ff3b30;background:#0008;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:17px;transition:border-color .15s,box-shadow .15s;box-shadow:0 0 18px #ff3b3088}
+#ring.yellow{border-color:#ffcc00;box-shadow:0 0 18px #ffcc0088}
+#ring.green{border-color:#34c759;box-shadow:0 0 18px #34c75988}
+#l1{font-size:20px;font-weight:800;text-shadow:0 1px 4px #000}
+#l2{font-size:14px;color:#e8e8ea;text-shadow:0 1px 4px #000;margin-top:2px}
+#mmwrap{position:absolute;right:12px;top:calc(max(12px,env(safe-area-inset-top)) + 92px);background:#000a;border-radius:10px;padding:4px;font-size:11px;color:#ccc;text-align:center}
+#mm{width:110px;height:110px;display:block;border-radius:6px}
+.bar{position:absolute;left:0;right:0;bottom:0;padding:14px 14px max(16px,env(safe-area-inset-bottom));display:flex;gap:10px;background:linear-gradient(#0000,#000c)}
+.bar button{flex:1}
+#toast{position:absolute;left:14px;right:14px;bottom:calc(92px + env(safe-area-inset-bottom));background:#000c;border-radius:12px;padding:10px 12px;font-size:14px;display:none}
+#result{background:#0c0d10}
+#result .imgbox{position:absolute;inset:0 0 150px 0;display:flex;align-items:center;justify-content:center;padding:10px;overflow:auto}
+#result img{max-width:100%;max-height:100%;object-fit:contain;border-radius:6px;background:#fff}
+#result .rbar{position:absolute;left:0;right:0;bottom:0;padding:12px 14px max(16px,env(safe-area-inset-bottom));display:grid;grid-template-columns:1fr 1fr;gap:10px;background:#15171c}
+#result .rbar .full{grid-column:1/3}
+#info{font-size:12px;color:#9aa;text-align:center;grid-column:1/3}
+.chk{display:flex;align-items:center;gap:8px;justify-content:center;font-size:15px;color:#ddd;grid-column:1/3}
+.chk input{width:22px;height:22px}
+</style>
+</head>
+<body>
+
+<div id="intro" class="screen on">
+  <h1>Wand Scan</h1>
+  <p>Turn your iPhone into a flatbed scanner. Hold it flat over a page, calibrate the height, then sweep slowly in rows or columns. The app tracks the surface and stitches everything into one image.</p>
+  <label>Phone height above the surface (cm, rough guess)
+    <input id="hcm" type="number" value="20" min="8" max="80" inputmode="decimal"></label>
+  <ul>
+    <li><b>Best height: about 15–25 cm.</b> Lower is sharper, but closer than ~12 cm the iPhone can't focus.</li>
+    <li>Hold the phone <b>parallel</b> to the surface. Tilting breaks the stitching.</li>
+    <li>The tracker needs <b>visible texture</b>: print, pictures, a patterned table. Blank white paper alone can't be tracked, so leave some table or other texture in view.</li>
+    <li>Sweep slowly (like painting). Do rows in a snake pattern and overlap each new row about 30–50% with the last.</li>
+    <li>Use bright, even light and avoid casting your own shadow. Safari can't switch the flashlight on from a web page, so use a lamp or Control Center flashlight.</li>
+    <li>Camera needs a secure (https) page.</li>
+  </ul>
+  <button class="big" id="open">Open camera</button>
+</div>
+
+<div id="scan" class="screen">
+  <video id="v" playsinline muted autoplay></video>
+  <div class="hud">
+    <div id="ring"><span id="ringT"></span></div>
+    <div><div id="l1">Starting…</div><div id="l2"></div></div>
+  </div>
+  <div id="mmwrap"><canvas id="mm" width="220" height="220"></canvas><div id="mmInfo">map</div></div>
+  <div id="toast"></div>
+  <div class="bar">
+    <button id="bMain">Calibrate</button>
+    <button id="bFinish" class="go" hidden>Finish</button>
+    <button id="bTorch" hidden>Torch</button>
+    <button id="bReset" class="warn" hidden>Reset</button>
+  </div>
+</div>
+
+<div id="result" class="screen">
+  <div class="imgbox"><img id="rimg" alt="scan result"></div>
+  <div class="rbar">
+    <div class="chk"><input type="checkbox" id="enh"><label for="enh">Whiten paper / boost contrast</label></div>
+    <button class="go" id="saveJpg">Save image</button>
+    <button class="go" id="savePdf">Save PDF</button>
+    <button id="more">Scan more</button>
+    <button class="warn" id="newScan">New scan</button>
+    <div id="info"></div>
+  </div>
+</div>
+
+<script>
+(()=>{
+'use strict';
+/* ---------- Tunables ---------- */
+const CFG={
+  TRACK_LONG:320,     // tracking image long edge (px)
+  TICK_MS:110,        // processing interval
+  GREEN:0.04,         // |height error| for green ring
+  YELLOW:0.09,        // |height error| for yellow ring
+  MAX_DEV:0.12,       // frames are not stitched beyond this height error
+  SPEED:0.022,        // max movement per tick (fraction of frame width) when stitching
+  STEP:0.22,          // place a new tile after moving this fraction of the frame
+  LOST_SCORE:0.45,    // min correlation to count as tracked
+  MAXHI:14e6,         // max pixels of the stitched canvas
+  STEADY_OK:12, STEADY_BAD:28, GREEN_TICKS:10
+};
+
+const $=id=>document.getElementById(id);
+const video=$('v'),ring=$('ring'),ringT=$('ringT'),l1=$('l1'),l2=$('l2'),mm=$('mm'),mmx=mm.getContext('2d'),toast=$('toast');
+const bMain=$('bMain'),bFinish=$('bFinish'),bTorch=$('bTorch'),bReset=$('bReset');
+
+let stream=null,vtrack=null,phase='idle',wake=null;
+let vw=0,vh=0,fw=0,fh=0,P0=1,hiP=1,HX=0,HY=0,N=0;
+const cap=document.createElement('canvas'),capx=cap.getContext('2d',{willReadFrequently:true});
+let g=null,prevG=null,tox,toy,gidx,ta,mask=null;
+let hi=null,hix=null,lo=null,lox=null,bx0=0,by0=0,bx1=0,by1=0;
+const tmpH=document.createElement('canvas'),tmpHx=tmpH.getContext('2d');
+const tmpL=document.createElement('canvas'),tmpLx=tmpL.getContext('2d');
+let cx=0,cy=0,vx=0,vy=0,smSc=1,lost=false,lpx=0,lpy=0,placed=0,cb=null,shRef=1,greenN=0,tickN=0,Hcm=20,speed=0,lostN=0;
+let mg=null,mv=null,gw=0,gh=0,rx0=0,ry0=0;
+let lastTick=0,torchOn=false;
+
+function say(msg,ms){toast.textContent=msg;toast.style.display='block';clearTimeout(say.t);say.t=setTimeout(()=>toast.style.display='none',ms||3500);}
+function show(id){document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('on',s.id===id));}
+
+/* ---------- Camera ---------- */
+$('open').onclick=async()=>{
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){alert('Camera not available. Open this page over https in Safari.');return;}
+  Hcm=parseFloat($('hcm').value)||20;
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30}}});
+  }catch(e){alert('Could not open camera: '+e.message+'\nAllow camera access for this site and make sure it is served over https.');return;}
+  vtrack=stream.getVideoTracks()[0];
+  video.srcObject=stream;
+  try{await video.play();}catch(e){}
+  show('scan');
+  try{
+    const caps=vtrack.getCapabilities?vtrack.getCapabilities():{};
+    if(caps.torch)bTorch.hidden=false;
+    if(caps.focusMode&&caps.focusMode.includes('continuous'))vtrack.applyConstraints({advanced:[{focusMode:'continuous'}]}).catch(()=>{});
+  }catch(e){}
+  try{if(navigator.wakeLock)wake=await navigator.wakeLock.request('screen');}catch(e){}
+  const init=()=>{if(video.videoWidth&&(phase==='idle'||phase==='calibrating'))initGeometry();};
+  video.addEventListener('loadedmetadata',init);video.addEventListener('resize',init);
+  init();
+  phase='idle';setUI();
+  requestAnimationFrame(loop);
+};
+bTorch.onclick=async()=>{torchOn=!torchOn;try{await vtrack.applyConstraints({advanced:[{torch:torchOn}]});}catch(e){say('Torch not supported here');torchOn=false;}};
+
+function initGeometry(){
+  vw=video.videoWidth;vh=video.videoHeight;if(!vw)return;
+  const k=CFG.TRACK_LONG/Math.max(vw,vh);
+  fw=Math.round(vw*k);fh=Math.round(vh*k);P0=vw/fw;hiP=P0;
+  cap.width=fw;cap.height=fh;
+  g=new Uint8Array(fw*fh);prevG=null;
+  HX=Math.floor(fw*0.35);HY=Math.floor(fh*0.35);
+  const ox=[],oy=[],gi=[];
+  const c0x=fw>>1,c0y=fh>>1;
+  for(let y=-HY;y<=HY;y+=2)for(let x=-HX;x<=HX;x+=2){ox.push(x);oy.push(y);gi.push((c0y+y)*fw+(c0x+x));}
+  N=ox.length;tox=Int16Array.from(ox);toy=Int16Array.from(oy);gidx=Int32Array.from(gi);ta=new Uint8Array(N);
+  // feather mask
+  const mw=64,mh=Math.max(8,Math.round(64*fh/fw));
+  mask=document.createElement('canvas');mask.width=mw;mask.height=mh;
+  const mx=mask.getContext('2d'),im=mx.createImageData(mw,mh),f=0.22;
+  for(let y=0;y<mh;y++)for(let x=0;x<mw;x++){
+    const dx=Math.min(x+0.5,mw-x-0.5)/mw,dy=Math.min(y+0.5,mh-y-0.5)/mh;
+    im.data[(y*mw+x)*4+3]=Math.round(255*Math.min(1,dx/f,dy/f));
+  }
+  mx.putImageData(im,0,0);
+}
+
+/* ---------- Mosaic ---------- */
+function mk(w,h,rf){const c=document.createElement('canvas');c.width=Math.max(1,w);c.height=Math.max(1,h);return [c,c.getContext('2d',rf?{willReadFrequently:true}:undefined)];}
+
+function ensureBounds(x0,y0,x1,y1){
+  x0=Math.floor(x0);y0=Math.floor(y0);x1=Math.ceil(x1);y1=Math.ceil(y1);
+  if(hi&&x0>=bx0&&y0>=by0&&x1<=bx1&&y1<=by1)return;
+  const mx=Math.ceil(fw*0.5),my=Math.ceil(fh*0.5);
+  let nx0=bx0,ny0=by0,nx1=bx1,ny1=by1;
+  if(!hi){nx0=x0-mx;ny0=y0-my;nx1=x1+mx;ny1=y1+my;}
+  else{if(x0<bx0)nx0=x0-mx;if(y0<by0)ny0=y0-my;if(x1>bx1)nx1=x1+mx;if(y1>by1)ny1=y1+my;}
+  const W=nx1-nx0,H=ny1-ny0;
+  const nP=Math.min(hiP,Math.sqrt(CFG.MAXHI/(W*H)));
+  const [nh,nhx]=mk(Math.ceil(W*nP),Math.ceil(H*nP),false);
+  const [nl,nlx]=mk(W,H,true);
+  if(hi){
+    nhx.drawImage(hi,(bx0-nx0)*nP,(by0-ny0)*nP,(bx1-bx0)*nP,(by1-by0)*nP);
+    nlx.drawImage(lo,bx0-nx0,by0-ny0);
+  }
+  hi=nh;hix=nhx;lo=nl;lox=nlx;hiP=nP;bx0=nx0;by0=ny0;bx1=nx1;by1=ny1;
+}
+
+const INSET=0.05;
+function blit(ctx,tmp,tctx,scale,src,SW,SH,ccx,ccy,sc){
+  const sx=SW*INSET,sy=SH*INSET,sw=SW*(1-2*INSET),sh=SH*(1-2*INSET);
+  const ux=ccx-fw*sc*(0.5-INSET),uy=ccy-fh*sc*(0.5-INSET),uw=fw*sc*(1-2*INSET),uh=fh*sc*(1-2*INSET);
+  const dx=(ux-bx0)*scale,dy=(uy-by0)*scale,dw=uw*scale,dh=uh*scale;
+  ctx.globalCompositeOperation='destination-over';   // fill only empty areas with the whole tile
+  ctx.drawImage(src,sx,sy,sw,sh,dx,dy,dw,dh);
+  ctx.globalCompositeOperation='source-over';
+  const tw=Math.max(2,Math.ceil(dw)),th=Math.max(2,Math.ceil(dh));
+  tmp.width=tw;tmp.height=th;                         // feathered copy blends over what is already there
+  tctx.drawImage(src,sx,sy,sw,sh,0,0,tw,th);
+  tctx.globalCompositeOperation='destination-in';
+  tctx.drawImage(mask,0,0,tw,th);
+  tctx.globalCompositeOperation='source-over';
+  ctx.drawImage(tmp,dx,dy,dw,dh);
+}
+
+function placeFrame(px,py,sc){
+  const hw=fw*sc*(0.5-INSET),hh=fh*sc*(0.5-INSET);
+  ensureBounds(px-hw-2,py-hh-2,px+hw+2,py+hh+2);
+  blit(hix,tmpH,tmpHx,hiP,video,vw,vh,px,py,sc);
+  blit(lox,tmpL,tmpLx,1,cap,fw,fh,px,py,sc);
+  if(!cb)cb={x0:px-hw,y0:py-hh,x1:px+hw,y1:py+hh};
+  else{cb.x0=Math.min(cb.x0,px-hw);cb.y0=Math.min(cb.y0,py-hh);cb.x1=Math.max(cb.x1,px+hw);cb.y1=Math.max(cb.y1,py+hh);}
+}
+
+/* ---------- Tracking (template matching against the stitched mosaic) ---------- */
+function fetchRegion(px,py,R){
+  const hx=Math.ceil(HX*1.2)+R+3,hy=Math.ceil(HY*1.2)+R+3;
+  const gx0=Math.max(0,Math.floor(px-hx)-bx0),gy0=Math.max(0,Math.floor(py-hy)-by0);
+  const gx1=Math.min(lo.width,Math.ceil(px+hx)-bx0),gy1=Math.min(lo.height,Math.ceil(py+hy)-by0);
+  gw=gx1-gx0;gh=gy1-gy0;if(gw<8||gh<8)return false;
+  const d=lox.getImageData(gx0,gy0,gw,gh).data;
+  mg=new Uint8Array(gw*gh);mv=new Uint8Array(gw*gh);
+  for(let i=0,j=0;j<mg.length;i+=4,j++){mg[j]=(d[i]*77+d[i+1]*150+d[i+2]*29)>>8;mv[j]=d[i+3]>128?1:0;}
+  rx0=gx0+bx0;ry0=gy0+by0;return true;
+}
+function score(ccx,ccy,sc,step,minFrac){
+  let n=0,sa=0,sb=0,saa=0,sbb=0,sab=0,tot=0;
+  for(let i=0;i<N;i+=step){
+    tot++;
+    const u=ccx+tox[i]*sc-rx0+0.5,v=ccy+toy[i]*sc-ry0+0.5;
+    if(u<0||v<0)continue;
+    const xi=u|0,yi=v|0;if(xi>=gw||yi>=gh)continue;
+    const k=yi*gw+xi;if(!mv[k])continue;
+    const a=ta[i],b=mg[k];
+    n++;sa+=a;sb+=b;saa+=a*a;sbb+=b*b;sab+=a*b;
+  }
+  if(n<tot*minFrac||n<30)return -1;
+  const va=saa-sa*sa/n,vb=sbb-sb*sb/n;
+  if(va<n*4||vb<n*4)return -1;               // flat / featureless
+  return (sab-sa*sb/n)/Math.sqrt(va*vb);
+}
+const parab=(c,l,r)=>{const d=l-2*c+r;return Math.abs(d)<1e-9?0:Math.max(-0.5,Math.min(0.5,0.5*(l-r)/d));};
+
+function doTrack(px,py,sc,R,doScale){
+  if(!fetchRegion(px,py,R))return null;
+  for(let i=0;i<N;i++)ta[i]=g[gidx[i]];
+  const sC=R>60?3:2,x0=Math.round(px),y0=Math.round(py);
+  let best=-2,bx=x0,by=y0;
+  for(let dy=-R;dy<=R;dy+=sC)for(let dx=-R;dx<=R;dx+=sC){
+    const s=score(x0+dx,y0+dy,sc,5,0.4);if(s>best){best=s;bx=x0+dx;by=y0+dy;}
+  }
+  if(best<0)return null;
+  let rb=-2,rx=bx,ry=by;
+  for(let dy=-sC;dy<=sC;dy++)for(let dx=-sC;dx<=sC;dx++){
+    const s=score(bx+dx,by+dy,sc,1,0.4);if(s>rb){rb=s;rx=bx+dx;ry=by+dy;}
+  }
+  if(rb<0)return null;
+  let fx=rx,fy=ry;
+  {const l=score(rx-1,ry,sc,1,0.3),r=score(rx+1,ry,sc,1,0.3),u=score(rx,ry-1,sc,1,0.3),d=score(rx,ry+1,sc,1,0.3);
+   if(l>=0&&r>=0)fx+=parab(rb,l,r);if(u>=0&&d>=0)fy+=parab(rb,u,d);}
+  let outSc=sc,fs=rb;
+  if(doScale){
+    const S=[],V=[];let bi=-1,bv=-2;
+    for(let i=0;i<13;i++){const s=0.85+i*0.025;const v=score(fx,fy,s,1,0.4);S.push(s);V.push(v);if(v>bv){bv=v;bi=i;}}
+    if(bi>=0&&bv>0){
+      outSc=S[bi];
+      if(bi>0&&bi<12&&V[bi-1]>=0&&V[bi+1]>=0)outSc+=parab(V[bi],V[bi-1],V[bi+1])*0.025;
+      let b2=-2,ax=rx,ay=ry;
+      for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const s=score(rx+dx,ry+dy,outSc,1,0.4);if(s>b2){b2=s;ax=rx+dx;ay=ry+dy;}}
+      if(b2>0){fx=ax;fy=ay;fs=b2;}
+    }
+  }
+  return {x:fx,y:fy,sc:outSc,score:fs,scaled:doScale};
+}
+
+/* ---------- Per-frame processing ---------- */
+function loop(t){
+  requestAnimationFrame(loop);
+  if(phase==='done'||!g||video.readyState<2||t-lastTick<CFG.TICK_MS)return;
+  lastTick=t;
+  try{process();}catch(e){console.error(e);}
+}
+
+function process(){
+  capx.drawImage(video,0,0,fw,fh);
+  const d=capx.getImageData(0,0,fw,fh).data;
+  const n=fw*fh;let mean=0;
+  for(let i=0,j=0;j<n;i+=4,j++){const v=(d[i]*77+d[i+1]*150+d[i+2]*29)>>8;g[j]=v;mean+=v;}
+  mean/=n;
+  let s1=0,s2=0,c=0;
+  for(let y=2;y<fh-2;y+=2)for(let x=2;x<fw-2;x+=2){const i=y*fw+x;const l=4*g[i]-g[i-1]-g[i+1]-g[i-fw]-g[i+fw];s1+=l;s2+=l*l;c++;}
+  const sh=s2/c-(s1/c)*(s1/c);
+  let diff=0;
+  if(prevG){let dd=0,cc=0;for(let i=0;i<n;i+=4){dd+=Math.abs(g[i]-prevG[i]);cc++;}diff=dd/cc;}
+  else prevG=new Uint8Array(n);
+  prevG.set(g);
+  shRef=Math.max(shRef*0.97,sh);
+  const m={mean,sh,diff};
+  tickN++;
+  if(phase==='idle'||phase==='calibrating')calibStep(m);else trackStep();
+  if(tickN%3===0)drawMM();
+}
+
+function quality(m){
+  if(m.mean<45)return['red','Too dark','Add light'];
+  if(m.sh<6)return['red','No detail','Need printed or textured surface'];
+  if(m.diff>CFG.STEADY_BAD)return['red','Hold steadier','Keep the phone still and flat'];
+  if(m.diff>CFG.STEADY_OK||m.sh<0.55*shRef)return['yellow','Almost…','Hold still, let it focus'];
+  return['green','Steady & sharp','Good'];
+}
+function setRing(col,txt,a,b){ring.className=col;ringT.textContent=txt||'';l1.textContent=a||'';l2.textContent=b||'';}
+
+function calibStep(m){
+  const q=quality(m);
+  if(phase==='idle'){setRing(q[0],'',q[0]==='green'?'Ready to calibrate':q[1],q[0]==='green'?'Hold at scan height, parallel to the surface, then tap Calibrate':q[2]);return;}
+  // calibrating
+  if(q[0]==='green')greenN++;else greenN=0;
+  if(greenN>=CFG.GREEN_TICKS){lockCalibration();return;}
+  setRing(q[0],greenN?Math.round(greenN/CFG.GREEN_TICKS*100)+'%':'',q[0]==='green'?'Hold still…':q[1],q[0]==='green'?'Locking height':q[2]);
+}
+
+function lockCalibration(){
+  hi=null;lo=null;cb=null;bx0=by0=bx1=by1=0;hiP=P0;
+  Hcm=parseFloat($('hcm').value)||Hcm;
+  cx=fw/2;cy=fh/2;vx=vy=0;smSc=1;lost=false;lostN=0;placed=1;
+  placeFrame(cx,cy,1);lpx=cx;lpy=cy;
+  phase='ready';setUI();
+  say('Height locked. Keep this height and tap Start scan.',4500);
+}
+
+function trackStep(){
+  const wantScale=(tickN%3===0)||lost;
+  const R=lost?100:Math.max(26,Math.round(20+Math.hypot(vx,vy)*1.6));
+  let r=doTrack(cx+(lost?0:vx),cy+(lost?0:vy),smSc,R,wantScale);
+  if(r&&r.score<CFG.LOST_SCORE)r=null;
+  if(!r){
+    lost=true;lostN++;vx=vy=0;speed=0;
+    setRing('red','!','Tracking lost','Move back over the area you already scanned');
+    return;
+  }
+  const wasLost=lost;lost=false;
+  const nvx=r.x-cx,nvy=r.y-cy;
+  speed=Math.hypot(nvx,nvy);
+  vx=0.5*vx+0.5*nvx;vy=0.5*vy+0.5*nvy;
+  cx=r.x;cy=r.y;
+  if(r.scaled)smSc=wasLost?r.sc:0.5*smSc+0.5*r.sc;
+  const dev=smSc-1,ad=Math.abs(dev);
+  const col=ad<=CFG.GREEN?'green':ad<=CFG.YELLOW?'yellow':'red';
+  const pct=(dev>=0?'+':'')+(dev*100).toFixed(0)+'%';
+  let a,b;
+  if(ad<=0.03){a='Height good';b='Within '+(Hcm*0.03).toFixed(1)+' cm of calibrated';}
+  else{
+    const cm=Math.abs(dev*Hcm).toFixed(1);
+    a=dev>0?'Lower the phone':'Raise the phone';
+    b='About '+cm+' cm '+(dev>0?'too high':'too low')+' ('+pct+')';
+  }
+  const tooFast=phase==='scanning'&&speed>CFG.SPEED*fw;
+  if(tooFast)b+=' · slow down';
+  if(phase==='ready')b+=' · tap Start scan';
+  setRing(col,pct,a,b);
+  if(phase==='scanning'&&!tooFast&&ad<CFG.MAX_DEV){
+    const need=Math.abs(cx-lpx)>CFG.STEP*fw*smSc||Math.abs(cy-lpy)>CFG.STEP*fh*smSc;
+    if(need){placeFrame(cx,cy,smSc);lpx=cx;lpy=cy;placed++;updateInfo();}
+  }
+}
+
+/* ---------- Mini-map ---------- */
+function drawMM(){
+  const w=mm.width,h=mm.height;
+  mmx.fillStyle='#1c1c1e';mmx.fillRect(0,0,w,h);
+  if(!hi)return;
+  const W=bx1-bx0,H=by1-by0,s=Math.min(w/W,h/H);
+  mmx.drawImage(hi,0,0,hi.width,hi.height,0,0,W*s,H*s);
+  mmx.strokeStyle=lost?'#ff3b30':'#34c759';mmx.lineWidth=3;
+  const rw=fw*smSc*s,rh=fh*smSc*s;
+  mmx.strokeRect((cx-bx0)*s-rw/2,(cy-by0)*s-rh/2,rw,rh);
+}
+function updateInfo(){
+  if(cb)$('mmInfo').textContent=placed+' tiles · '+Math.round((cb.x1-cb.x0)*hiP)+'×'+Math.round((cb.y1-cb.y0)*hiP);
+}
+
+/* ---------- UI / buttons ---------- */
+function setUI(){
+  bFinish.hidden=!(phase==='ready'||phase==='scanning')||!hi;
+  bReset.hidden=!(phase==='ready'||phase==='scanning');
+  bMain.className='';
+  if(phase==='idle')bMain.textContent='Calibrate';
+  else if(phase==='calibrating')bMain.textContent='Cancel';
+  else if(phase==='ready'){bMain.textContent='Start scan';bMain.className='go';}
+  else if(phase==='scanning')bMain.textContent='Pause';
+  updateInfo();
+}
+bMain.onclick=()=>{
+  if(phase==='idle'){phase='calibrating';greenN=0;}
+  else if(phase==='calibrating'){phase='idle';}
+  else if(phase==='ready'){phase='scanning';say('Scanning: sweep slowly, keep the ring green.',3000);}
+  else if(phase==='scanning'){phase='ready';}
+  setUI();
+};
+bReset.onclick=()=>{
+  if(!confirm('Discard this scan and start over?'))return;
+  resetAll();
+};
+function resetAll(){hi=lo=null;cb=null;placed=0;phase='idle';lost=false;greenN=0;$('mmInfo').textContent='map';setUI();drawMM();if(!stream)show('intro');else show('scan');}
+bFinish.onclick=()=>{if(!hi||!cb)return;phase='done';show('result');buildResult();};
+
+/* ---------- Result / export ---------- */
+let jpgBlob=null,pdfBlob=null,rUrl=null;
+async function buildResult(){
+  $('info').textContent='Rendering…';
+  const sx=Math.max(0,Math.floor((cb.x0-bx0)*hiP)),sy=Math.max(0,Math.floor((cb.y0-by0)*hiP));
+  const w=Math.min(hi.width-sx,Math.ceil((cb.x1-cb.x0)*hiP)),h=Math.min(hi.height-sy,Math.ceil((cb.y1-cb.y0)*hiP));
+  const out=document.createElement('canvas');out.width=w;out.height=h;
+  const o=out.getContext('2d');o.fillStyle='#fff';o.fillRect(0,0,w,h);
+  o.drawImage(hi,sx,sy,w,h,0,0,w,h);
+  if($('enh').checked)enhance(out);
+  jpgBlob=await new Promise(r=>out.toBlob(r,'image/jpeg',0.92));
+  const bytes=new Uint8Array(await jpgBlob.arrayBuffer());
+  pdfBlob=makePDF(bytes,w,h);
+  if(rUrl)URL.revokeObjectURL(rUrl);
+  rUrl=URL.createObjectURL(jpgBlob);$('rimg').src=rUrl;
+  $('info').textContent=w+' × '+h+' px · '+(jpgBlob.size/1048576).toFixed(1)+' MB';
+}
+$('enh').onchange=()=>buildResult();
+
+function enhance(c){
+  const x=c.getContext('2d'),im=x.getImageData(0,0,c.width,c.height),d=im.data;
+  const hist=new Uint32Array(256);let n=0;
+  for(let i=0;i<d.length;i+=16){hist[(d[i]*77+d[i+1]*150+d[i+2]*29)>>8]++;n++;}
+  const pct=p=>{let a=0;const t=n*p;for(let i=0;i<256;i++){a+=hist[i];if(a>=t)return i;}return 255;};
+  const b=pct(0.01),w=Math.max(b+30,pct(0.88));
+  const lut=new Uint8Array(256);
+  for(let v=0;v<256;v++){let t=(v-b)/(w-b);t=t<0?0:t>1?1:t;lut[v]=Math.round(255*t);}
+  for(let i=0;i<d.length;i+=4){d[i]=lut[d[i]];d[i+1]=lut[d[i+1]];d[i+2]=lut[d[i+2]];}
+  x.putImageData(im,0,0);
+}
+
+function makePDF(jpg,w,h){
+  const enc=new TextEncoder(),parts=[],offs=[];let len=0;
+  const push=d=>{const b=typeof d==='string'?enc.encode(d):d;parts.push(b);len+=b.length;};
+  const pw=(w*0.36).toFixed(2),ph=(h*0.36).toFixed(2);   // ~200 dpi page
+  push('%PDF-1.4\n');
+  const obj=(n,body)=>{offs[n]=len;push(n+' 0 obj\n'+body+'\nendobj\n');};
+  obj(1,'<< /Type /Catalog /Pages 2 0 R >>');
+  obj(2,'<< /Type /Pages /Kids [3 0 R] /Count 1 >>');
+  obj(3,'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 '+pw+' '+ph+'] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>');
+  offs[4]=len;
+  push('4 0 obj\n<< /Type /XObject /Subtype /Image /Width '+w+' /Height '+h+' /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length '+jpg.length+' >>\nstream\n');
+  push(jpg);push('\nendstream\nendobj\n');
+  const cs='q '+pw+' 0 0 '+ph+' 0 0 cm /Im0 Do Q';
+  obj(5,'<< /Length '+cs.length+' >>\nstream\n'+cs+'\nendstream');
+  const xref=len;let x='xref\n0 6\n0000000000 65535 f \n';
+  for(let i=1;i<=5;i++)x+=String(offs[i]).padStart(10,'0')+' 00000 n \n';
+  push(x+'trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n'+xref+'\n%%EOF');
+  return new Blob(parts,{type:'application/pdf'});
+}
+
+function saveBlob(blob,name){            // must be called straight from a tap
+  if(!blob)return;
+  const file=new File([blob],name,{type:blob.type});
+  if(navigator.canShare&&navigator.canShare({files:[file]})){
+    navigator.share({files:[file],title:name}).catch(e=>{if(e&&e.name!=='AbortError')fallback();});
+    return;
+  }
+  fallback();
+  function fallback(){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();a.remove();}
+}
+const stamp=()=>{const d=new Date(),p=n=>String(n).padStart(2,'0');return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+'-'+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds());};
+$('saveJpg').onclick=()=>saveBlob(jpgBlob,'scan-'+stamp()+'.jpg');
+$('savePdf').onclick=()=>saveBlob(pdfBlob,'scan-'+stamp()+'.pdf');
+$('more').onclick=()=>{phase='ready';lost=true;show('scan');setUI();say('Move back over the scanned area, then tap Start scan.',4000);};
+$('newScan').onclick=()=>{if(confirm('Discard this scan and start a new one?')){resetAll();show('scan');}};
+
+})();
+</script>
+</body>
+</html>
