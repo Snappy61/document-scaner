@@ -24,6 +24,7 @@ button.go{background:#34c759;color:#04210d}
 button.warn{background:#3a2326;color:#ff8a80}
 button[hidden]{display:none}
 #v{position:absolute;left:0;top:0;width:100%;height:100%;object-fit:cover;background:#000}
+#ov{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
 #flash{position:absolute;left:0;top:0;right:0;bottom:0;border:8px solid #fff;opacity:0;pointer-events:none}
 #flash.on{animation:fl .28s ease-out}
 @keyframes fl{from{opacity:.9}to{opacity:0}}
@@ -56,8 +57,8 @@ button[hidden]{display:none}
   <label>Phone height above the surface (cm, rough guess)
     <input id="hcm" type="number" value="20" min="8" max="80" inputmode="decimal"></label>
   <ul>
-    <li>Start at a comfortable height, about <b>15–25 cm</b>. Where you are when you tap Start becomes the reference height.</li>
-    <li>Sweep slowly, like painting. For big things do rows or columns in a snake pattern and overlap each pass by about 30–50%.</li>
+    <li>Start with the <b>top-left corner</b> of the area you want to scan in view, at a comfortable height of about <b>15–25 cm</b>. The first shot sets four <b>start points</b> on the surface. The top-left one is your <b>home</b>: if tracking is ever lost, return to it and the scan carries on.</li>
+    <li>Sweep slowly, like painting. For big things do rows or columns in a snake pattern and overlap each pass by about 30–50%. There's no size limit while scanning.</li>
     <li><b>Go closer for detail.</b> Closer shots are higher resolution and replace blurrier or farther ones, as long as the camera can still focus (about 12 cm minimum).</li>
     <li>Keep the phone roughly <b>parallel</b> to the surface.</li>
     <li>The tracker needs <b>visible texture</b> such as print, pictures or a patterned table. Plain white paper alone can't be tracked.</li>
@@ -69,6 +70,7 @@ button[hidden]{display:none}
 
 <div id="scan" class="screen">
   <video id="v" playsinline muted autoplay></video>
+  <canvas id="ov"></canvas>
   <div id="flash"></div>
   <div class="hud">
     <div id="ring"><span id="ringT"></span></div>
@@ -108,35 +110,41 @@ const CFG={
   FOCUS_OK:0.8,       // focus ratio (vs recent best) needed to shoot
   FOCUS_WARN:0.6,     // below this the ring turns red
   LOST_SCORE:0.45,    // min correlation to count as tracked
-  MAXHI:14e6,         // max pixels of the stitched canvas
+  FAILS:3,            // consecutive failed ticks before "tracking lost"
+  ANCHOR_OK:0.7,      // min correlation to trust a start point
+  MAXOUT:15e6,        // max pixels of the final image (iPhone canvas limit is ~16.7M)
   TEX_MIN:6,          // min texture energy
   DARK:45,            // min mean brightness
   STEADY_OK:18,       // frame-difference limit while waiting for the first shot
   ARM_TICKS:30,       // give up waiting for perfect first shot after this many ticks
   CELL:0.2,           // coverage cell size (fraction of frame width)
+  TILE:128,           // tracking-map tile size (units)
   MIN_SC:0.4, MAX_SC:2.4
 };
 
 const $=id=>document.getElementById(id);
-const video=$('v'),ring=$('ring'),ringT=$('ringT'),l1=$('l1'),l2=$('l2'),mm=$('mm'),mmx=mm.getContext('2d'),toast=$('toast');
+const video=$('v'),ring=$('ring'),ringT=$('ringT'),l1=$('l1'),l2=$('l2'),mm=$('mm'),mmx=mm.getContext('2d'),toast=$('toast'),ov=$('ov'),ovx=ov.getContext('2d');
 const bMain=$('bMain'),bFinish=$('bFinish'),bTorch=$('bTorch'),bReset=$('bReset');
 
 let stream=null,vtrack=null,phase='idle',wake=null;   // idle | scanning | paused | done
-let vw=0,vh=0,fw=0,fh=0,P0=1,hiP=1,HX=0,HY=0,N=0,FC=256;
+let vw=0,vh=0,fw=0,fh=0,P0=1,HX=0,HY=0,N=0,FC=256;
 const cap=document.createElement('canvas'),capx=cap.getContext('2d',{willReadFrequently:true});
 const fcv=document.createElement('canvas'),fcx=fcv.getContext('2d',{willReadFrequently:true});
+const shotCv=document.createElement('canvas'),shotCx=shotCv.getContext('2d');
 let g=null,prevG=null,fg=null,h2=null,tox,toy,gidx,ta,mask=null;
-let hi=null,hix=null,lo=null,lox=null,bx0=0,by0=0,bx1=0,by1=0;
 const tmpH=document.createElement('canvas'),tmpHx=tmpH.getContext('2d');
-const tmpL=document.createElement('canvas'),tmpLx=tmpL.getContext('2d');
-let lastFr=1,stableN=0,lastScore=0,cx=0,cy=0,vx=0,vy=0,smSc=1,lost=false,placed=0,cb=null,focusRef=1e-6,tickN=0,Hcm=20,speed=0,armGood=0,armTicks=0;
+let lastFr=1,stableN=0,failN=0,cx=0,cy=0,vx=0,vy=0,smSc=1,lost=false,placed=0,cb=null,focusRef=1e-6,tickN=0,Hcm=20,speed=0,armGood=0,armTicks=0,lastScore=0,relocIdx=0;
 let cov=new Map(),cs=64;
+let tiles=new Map();                 // sparse tracking map: gray + valid per tile, no size limit
+let shots=[];                        // stored shots {x,y,sc,allow,th,blob}
+let anchors=[];                      // 4 start points with persistent reference patches
 let mg=null,mv=null,gw=0,gh=0,rx0=0,ry0=0;
 let lastTick=0,torchOn=false;
 
 function say(msg,ms){toast.textContent=msg;toast.style.display='block';clearTimeout(say.t);say.t=setTimeout(()=>toast.style.display='none',ms||3500);}
 function show(id){document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('on',s.id===id));}
 function flash(){const f=$('flash');f.classList.remove('on');void f.offsetWidth;f.classList.add('on');}
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
 /* ---------- Camera ---------- */
 $('open').onclick=async()=>{
@@ -155,7 +163,7 @@ $('open').onclick=async()=>{
     if(caps.focusMode&&caps.focusMode.includes('continuous'))vtrack.applyConstraints({advanced:[{focusMode:'continuous'}]}).catch(()=>{});
   }catch(e){}
   try{if(navigator.wakeLock)wake=await navigator.wakeLock.request('screen');}catch(e){}
-  const init=()=>{if(video.videoWidth&&!hi)initGeometry();};
+  const init=()=>{if(video.videoWidth&&!shots.length)initGeometry();};
   video.addEventListener('loadedmetadata',init);video.addEventListener('resize',init);
   init();
   phase='idle';setUI();
@@ -166,8 +174,8 @@ bTorch.onclick=async()=>{torchOn=!torchOn;try{await vtrack.applyConstraints({adv
 function initGeometry(){
   vw=video.videoWidth;vh=video.videoHeight;if(!vw)return;
   const k=CFG.TRACK_LONG/Math.max(vw,vh);
-  fw=Math.round(vw*k);fh=Math.round(vh*k);P0=vw/fw;hiP=P0;
-  cap.width=fw;cap.height=fh;
+  fw=Math.round(vw*k);fh=Math.round(vh*k);P0=vw/fw;
+  cap.width=fw;cap.height=fh;shotCv.width=vw;shotCv.height=vh;
   g=new Uint8Array(fw*fh);prevG=null;
   FC=Math.min(256,vw&~1,vh&~1);fcv.width=FC;fcv.height=FC;fg=new Uint8Array(FC*FC);h2=new Uint8Array((FC>>1)*(FC>>1));
   HX=Math.floor(fw*0.35);HY=Math.floor(fh*0.35);
@@ -176,8 +184,7 @@ function initGeometry(){
   for(let y=-HY;y<=HY;y+=2)for(let x=-HX;x<=HX;x+=2){ox.push(x);oy.push(y);gi.push((c0y+y)*fw+(c0x+x));}
   N=ox.length;tox=Int16Array.from(ox);toy=Int16Array.from(oy);gidx=Int32Array.from(gi);ta=new Uint8Array(N);
   cs=Math.max(8,Math.round(fw*CFG.CELL));
-  // feather mask
-  const mw=64,mh=Math.max(8,Math.round(64*fh/fw));
+  const mw=64,mh=Math.max(8,Math.round(64*fh/fw));         // feather mask
   mask=document.createElement('canvas');mask.width=mw;mask.height=mh;
   const mx=mask.getContext('2d'),im=mx.createImageData(mw,mh),f=0.22;
   for(let y=0;y<mh;y++)for(let x=0;x<mw;x++){
@@ -187,60 +194,9 @@ function initGeometry(){
   mx.putImageData(im,0,0);
 }
 
-/* ---------- Mosaic ---------- */
-function mk(w,h,rf){const c=document.createElement('canvas');c.width=Math.max(1,w);c.height=Math.max(1,h);return [c,c.getContext('2d',rf?{willReadFrequently:true}:undefined)];}
-
-function ensureBounds(x0,y0,x1,y1){
-  x0=Math.floor(x0);y0=Math.floor(y0);x1=Math.ceil(x1);y1=Math.ceil(y1);
-  if(hi&&x0>=bx0&&y0>=by0&&x1<=bx1&&y1<=by1)return;
-  const mx=Math.ceil(fw*0.5),my=Math.ceil(fh*0.5);
-  let nx0=bx0,ny0=by0,nx1=bx1,ny1=by1;
-  if(!hi){nx0=x0-mx;ny0=y0-my;nx1=x1+mx;ny1=y1+my;}
-  else{if(x0<bx0)nx0=x0-mx;if(y0<by0)ny0=y0-my;if(x1>bx1)nx1=x1+mx;if(y1>by1)ny1=y1+my;}
-  const W=nx1-nx0,H=ny1-ny0;
-  const nP=Math.min(hiP,Math.sqrt(CFG.MAXHI/(W*H)));
-  const [nh,nhx]=mk(Math.ceil(W*nP),Math.ceil(H*nP),false);
-  const [nl,nlx]=mk(W,H,true);
-  if(hi){
-    nhx.drawImage(hi,(bx0-nx0)*nP,(by0-ny0)*nP,(bx1-bx0)*nP,(by1-by0)*nP);
-    nlx.drawImage(lo,bx0-nx0,by0-ny0);
-  }
-  hi=nh;hix=nhx;lo=nl;lox=nlx;hiP=nP;bx0=nx0;by0=ny0;bx1=nx1;by1=ny1;
-}
-
 const INSET=0.05;
-// allow = null (whole tile) or list of [i,j] coverage cells where this shot is better than what is there
-function blit(ctx,tmp,tctx,scale,src,SW,SH,ccx,ccy,sc,allow){
-  const sx=SW*INSET,sy=SH*INSET,sw=SW*(1-2*INSET),sh=SH*(1-2*INSET);
-  const ux=ccx-fw*sc*(0.5-INSET),uy=ccy-fh*sc*(0.5-INSET),uw=fw*sc*(1-2*INSET),uh=fh*sc*(1-2*INSET);
-  const dx=(ux-bx0)*scale,dy=(uy-by0)*scale,dw=uw*scale,dh=uh*scale;
-  ctx.globalCompositeOperation='destination-over';   // fill only empty areas with the whole tile
-  ctx.drawImage(src,sx,sy,sw,sh,dx,dy,dw,dh);
-  ctx.globalCompositeOperation='source-over';
-  if(allow&&!allow.length)return;
-  const tw=Math.max(2,Math.ceil(dw)),th=Math.max(2,Math.ceil(dh));
-  tmp.width=tw;tmp.height=th;                         // feathered copy blends over what is already there
-  tctx.drawImage(src,sx,sy,sw,sh,0,0,tw,th);
-  tctx.globalCompositeOperation='destination-in';
-  tctx.drawImage(mask,0,0,tw,th);
-  tctx.globalCompositeOperation='source-over';
-  if(allow){
-    ctx.save();ctx.beginPath();
-    for(const c of allow)ctx.rect((c[0]*cs-bx0)*scale,(c[1]*cs-by0)*scale,cs*scale,cs*scale);
-    ctx.clip();ctx.drawImage(tmp,dx,dy,dw,dh);ctx.restore();
-  }else ctx.drawImage(tmp,dx,dy,dw,dh);
-}
 
-function placeFrame(px,py,sc,allow){
-  const hw=fw*sc*(0.5-INSET),hh=fh*sc*(0.5-INSET);
-  ensureBounds(px-hw-2,py-hh-2,px+hw+2,py+hh+2);
-  blit(hix,tmpH,tmpHx,hiP,video,vw,vh,px,py,sc,allow);
-  blit(lox,tmpL,tmpLx,1,cap,fw,fh,px,py,sc,allow);
-  if(!cb)cb={x0:px-hw,y0:py-hh,x1:px+hw,y1:py+hh};
-  else{cb.x0=Math.min(cb.x0,px-hw);cb.y0=Math.min(cb.y0,py-hh);cb.x1=Math.max(cb.x1,px+hw);cb.y1=Math.max(cb.y1,py+hh);}
-}
-
-/* coverage grid: remembers the best shot quality (sharpness x closeness) per cell */
+/* ---------- Coverage grid (best shot quality per cell) ---------- */
 const ck=(i,j)=>(i+20000)*40000+(j+20000);
 function cellsFor(px,py,sc,Q){
   const hw=fw*sc*0.45,hh=fh*sc*0.45;
@@ -258,17 +214,45 @@ function cellsFor(px,py,sc,Q){
 }
 function markCells(all,Q){for(const k of all){const e=cov.get(k);if(e===undefined||Q>e)cov.set(k,Q);}}
 
-/* ---------- Tracking (template matching against the stitched mosaic) ---------- */
-function fetchRegion(px,py,R,sc){
-  const hx=Math.ceil(HX*Math.max(1.3,sc*1.3))+R+3,hy=Math.ceil(HY*Math.max(1.3,sc*1.3))+R+3;
-  const gx0=Math.max(0,Math.floor(px-hx)-bx0),gy0=Math.max(0,Math.floor(py-hy)-by0);
-  const gx1=Math.min(lo.width,Math.ceil(px+hx)-bx0),gy1=Math.min(lo.height,Math.ceil(py+hy)-by0);
-  gw=gx1-gx0;gh=gy1-gy0;if(gw<8||gh<8)return false;
-  const d=lox.getImageData(gx0,gy0,gw,gh).data;
-  mg=new Uint8Array(gw*gh);mv=new Uint8Array(gw*gh);
-  for(let i=0,j=0;j<mg.length;i+=4,j++){mg[j]=(d[i]*77+d[i+1]*150+d[i+2]*29)>>8;mv[j]=d[i+3]>128?1:0;}
-  rx0=gx0+bx0;ry0=gy0+by0;return true;
+/* ---------- Sparse tracking map (tiles of gray + valid) ---------- */
+const tk=(ti,tj)=>(ti+8192)*16384+(tj+8192);
+function paintLo(px,py,sc,aset){
+  const T=CFG.TILE,hw=fw*sc*(0.5-INSET),hh=fh*sc*(0.5-INSET);
+  const u0=Math.floor(px-hw),u1=Math.ceil(px+hw),v0=Math.floor(py-hh),v1=Math.ceil(py+hh);
+  const inv=1/sc,ax=fw/2,ay=fh/2;
+  for(let tj=Math.floor(v0/T);tj<=Math.floor((v1-1)/T);tj++)for(let ti=Math.floor(u0/T);ti<=Math.floor((u1-1)/T);ti++){
+    const key=tk(ti,tj);let t=tiles.get(key);
+    if(!t){t={g:new Uint8Array(T*T),v:new Uint8Array(T*T)};tiles.set(key,t);}
+    const xs=Math.max(u0,ti*T),xe=Math.min(u1,(ti+1)*T),ys=Math.max(v0,tj*T),ye=Math.min(v1,(tj+1)*T);
+    for(let v=ys;v<ye;v++){
+      const b=((v+0.5-py)*inv+ay)|0;if(b<0||b>=fh)continue;
+      for(let u=xs;u<xe;u++){
+        const a=((u+0.5-px)*inv+ax)|0;if(a<0||a>=fw)continue;
+        const idx=(v-tj*T)*T+(u-ti*T);
+        if(aset&&t.v[idx]&&!aset.has(ck(Math.floor(u/cs),Math.floor(v/cs))))continue;
+        t.g[idx]=g[b*fw+a];t.v[idx]=1;
+      }
+    }
+  }
 }
+function fetchRegion(px,py,R,sc){
+  const T=CFG.TILE;
+  const hx=Math.ceil(HX*Math.max(1.3,sc*1.3))+R+3,hy=Math.ceil(HY*Math.max(1.3,sc*1.3))+R+3;
+  const u0=Math.floor(px-hx),u1=Math.ceil(px+hx),v0=Math.floor(py-hy),v1=Math.ceil(py+hy);
+  gw=u1-u0;gh=v1-v0;if(gw<8||gh<8)return false;
+  mg=new Uint8Array(gw*gh);mv=new Uint8Array(gw*gh);let any=false;
+  for(let tj=Math.floor(v0/T);tj<=Math.floor((v1-1)/T);tj++)for(let ti=Math.floor(u0/T);ti<=Math.floor((u1-1)/T);ti++){
+    const t=tiles.get(tk(ti,tj));if(!t)continue;any=true;
+    const xs=Math.max(u0,ti*T),xe=Math.min(u1,(ti+1)*T),ys=Math.max(v0,tj*T),ye=Math.min(v1,(tj+1)*T),len=xe-xs;
+    for(let v=ys;v<ye;v++){
+      const s0=(v-tj*T)*T+(xs-ti*T),d0=(v-v0)*gw+(xs-u0);
+      mg.set(t.g.subarray(s0,s0+len),d0);mv.set(t.v.subarray(s0,s0+len),d0);
+    }
+  }
+  rx0=u0;ry0=v0;return any;
+}
+
+/* ---------- Tracking (template matching against the tile map) ---------- */
 function score(ccx,ccy,sc,step,minFrac){
   let n=0,sa=0,sb=0,saa=0,sbb=0,sab=0,tot=0;
   for(let i=0;i<N;i+=step){
@@ -287,7 +271,7 @@ function score(ccx,ccy,sc,step,minFrac){
 }
 const parab=(c,l,r)=>{const d=l-2*c+r;return Math.abs(d)<1e-9?0:Math.max(-0.5,Math.min(0.5,0.5*(l-r)/d));};
 
-function doTrack(px,py,sc,R,doScale,wasLost){
+function doTrack(px,py,sc,R,wasLost){
   if(!fetchRegion(px,py,R,sc))return null;
   for(let i=0;i<N;i++)ta[i]=g[gidx[i]];
   const sC=R>60?3:2,x0=Math.round(px),y0=Math.round(py);
@@ -305,34 +289,112 @@ function doTrack(px,py,sc,R,doScale,wasLost){
   {const l=score(rx-1,ry,sc,1,0.3),r=score(rx+1,ry,sc,1,0.3),u=score(rx,ry-1,sc,1,0.3),d=score(rx,ry+1,sc,1,0.3);
    if(l>=0&&r>=0)fx+=parab(rb,l,r);if(u>=0&&d>=0)fy+=parab(rb,u,d);}
   let outSc=sc,fs=rb;
-  if(doScale){
-    const base=sc,ratio=wasLost?1.07:1.04,half=wasLost?9:6;
-    const S=[],V=[];let bi=-1,bv=-2;
-    for(let k=-half;k<=half;k++){
-      const s=base*Math.pow(ratio,k);S.push(s);
-      const v=(s<CFG.MIN_SC||s>CFG.MAX_SC)?-1:score(fx,fy,s,1,0.25);
-      V.push(v);if(v>bv){bv=v;bi=S.length-1;}
+  const ratio=wasLost?1.07:1.04,half=wasLost?9:6;
+  const S=[],V=[];let bi=-1,bv=-2;
+  for(let k=-half;k<=half;k++){
+    const s=sc*Math.pow(ratio,k);S.push(s);
+    const v=(s<CFG.MIN_SC||s>CFG.MAX_SC)?-1:score(fx,fy,s,1,0.25);
+    V.push(v);if(v>bv){bv=v;bi=S.length-1;}
+  }
+  if(bi>=0&&bv>0){
+    outSc=S[bi];
+    if(bi>0&&bi<S.length-1&&V[bi-1]>=0&&V[bi+1]>=0)outSc*=Math.pow(ratio,parab(V[bi],V[bi-1],V[bi+1]));
+    let b2=-2,ax=rx,ay=ry;
+    for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const s=score(rx+dx,ry+dy,outSc,1,0.25);if(s>b2){b2=s;ax=rx+dx;ay=ry+dy;}}
+    if(b2>0){fx=ax;fy=ay;fs=b2;}
+  }
+  return {x:fx,y:fy,sc:outSc,score:fs};
+}
+
+/* ---------- Start points (4 anchors with permanent reference patches) ---------- */
+const PH=20,PN=400;                 // patch is 40x40 sampled every 2px
+const ptx=new Int8Array(PN),pty=new Int8Array(PN);
+{let i=0;for(let y=-PH;y<PH;y+=2)for(let x=-PH;x<PH;x+=2){ptx[i]=x;pty[i]=y;i++;}}
+
+function createAnchors(){
+  anchors=[];
+  const names=['TL','TR','BL','BR'],sx=[-1,1,-1,1],sy=[-1,-1,1,1];
+  for(let k=0;k<4;k++){
+    const tx=Math.round(fw/2+sx[k]*0.3*fw),ty=Math.round(fh/2+sy[k]*0.3*fh);
+    let best=-1,bx=tx,by=ty;
+    for(let dy=-24;dy<=24;dy+=8)for(let dx=-24;dx<=24;dx+=8){   // pick the most textured spot nearby
+      const x=tx+dx,y=ty+dy;
+      if(x<PH+2||x>fw-PH-3||y<PH+2||y>fh-PH-3)continue;
+      let s=0,s2=0;
+      for(let i=0;i<PN;i++){const v=g[(y+pty[i])*fw+(x+ptx[i])];s+=v;s2+=v*v;}
+      const va=s2/PN-(s/PN)*(s/PN);if(va>best){best=va;bx=x;by=y;}
     }
-    if(bi>=0&&bv>0){
-      outSc=S[bi];
-      if(bi>0&&bi<S.length-1&&V[bi-1]>=0&&V[bi+1]>=0)outSc*=Math.pow(ratio,parab(V[bi],V[bi-1],V[bi+1]));
-      let b2=-2,ax=rx,ay=ry;
-      for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const s=score(rx+dx,ry+dy,outSc,1,0.25);if(s>b2){b2=s;ax=rx+dx;ay=ry+dy;}}
-      if(b2>0){fx=ax;fy=ay;fs=b2;}
+    const pv=new Uint8Array(PN);
+    for(let i=0;i<PN;i++)pv[i]=g[(by+pty[i])*fw+(bx+ptx[i])];
+    anchors.push({name:names[k],gx:bx,gy:by,pv});   // first frame has centre (fw/2,fh/2) and scale 1, so global = frame pixels
+  }
+}
+// find anchor patch in the live gray image around (lx0,ly0)
+function matchAnchor(a,lx0,ly0,Rx,Ry,step,scs,pstep){
+  let best={score:-2,lx:lx0,ly:ly0,s:scs[0]};
+  for(let si=0;si<scs.length;si++){
+    const s=scs[si],inv=1/s;
+    for(let dy=-Ry;dy<=Ry;dy+=step)for(let dx=-Rx;dx<=Rx;dx+=step){
+      const lx=lx0+dx,ly=ly0+dy;
+      let n=0,sa=0,sb=0,saa=0,sbb=0,sab=0,tot=0;
+      for(let i=0;i<PN;i+=pstep){
+        tot++;
+        const u=lx+ptx[i]*inv+0.5,v=ly+pty[i]*inv+0.5;
+        if(u<0||v<0)continue;
+        const xi=u|0,yi=v|0;if(xi>=fw||yi>=fh)continue;
+        const b=g[yi*fw+xi],a2=a.pv[i];
+        n++;sa+=a2;sb+=b;saa+=a2*a2;sbb+=b*b;sab+=a2*b;
+      }
+      if(n<tot*0.75||n<30)continue;
+      const va=saa-sa*sa/n,vb=sbb-sb*sb/n;if(va<n*4||vb<n*4)continue;
+      const r=(sab-sa*sb/n)/Math.sqrt(va*vb);
+      if(r>best.score)best={score:r,lx,ly,s};
     }
   }
-  return {x:fx,y:fy,sc:outSc,score:fs,scaled:doScale};
+  return best;
+}
+const fromAnchor=(a,m)=>({x:a.gx-(m.lx-fw/2)*m.s,y:a.gy-(m.ly-fh/2)*m.s,s:m.s});
+
+// tracking lost: look for the home point (and one other start point per tick) anywhere in the live view
+function relocalize(){
+  if(!anchors.length)return false;
+  const order=[0];if(anchors.length>1)order.push(1+(relocIdx++%(anchors.length-1)));
+  const scs=[0.88,0.94,1,1.06,1.12].map(k=>smSc*k).filter(s=>s>=CFG.MIN_SC&&s<=CFG.MAX_SC);
+  let bA=null,bM=null;
+  for(const ai of order){
+    const a=anchors[ai];
+    const m=matchAnchor(a,fw/2,fh/2,Math.floor(fw/2-PH-4),Math.floor(fh/2-PH-4),3,scs,2);
+    if(!bM||m.score>bM.score){bM=m;bA=a;}
+  }
+  if(!bM||bM.score<0.55)return false;
+  const m2=matchAnchor(bA,bM.lx,bM.ly,2,2,1,[bM.s*0.97,bM.s,bM.s*1.03],1);
+  if(m2.score<CFG.ANCHOR_OK)return false;
+  const p=fromAnchor(bA,m2);cx=p.x;cy=p.y;smSc=p.s;return true;
+}
+// while tracking: use any visible start point to remove drift (gently)
+function anchorCorrect(){
+  let bA=null,bM=null;
+  for(const a of anchors){
+    const lx=fw/2+(a.gx-cx)/smSc,ly=fh/2+(a.gy-cy)/smSc;
+    if(lx<PH+6||lx>fw-PH-6||ly<PH+6||ly>fh-PH-6)continue;
+    const m=matchAnchor(a,lx,ly,8,8,2,[smSc*0.97,smSc,smSc*1.03],2);
+    if(!bM||m.score>bM.score){bM=m;bA=a;}
+  }
+  if(bM&&bM.score>=CFG.ANCHOR_OK){
+    const p=fromAnchor(bA,bM),dx=p.x-cx,dy=p.y-cy;
+    if(Math.hypot(dx,dy)<40){cx+=dx*0.3;cy+=dy*0.3;smSc*=Math.pow(p.s/smSc,0.3);}
+  }
 }
 
 /* ---------- Per-frame processing ---------- */
 function loop(t){
   requestAnimationFrame(loop);
   if(phase==='done'||!g||video.readyState<2||t-lastTick<CFG.TICK_MS)return;
-  lastTick=t;
-  try{process();}catch(e){console.error(e);}
+  const dt=lastTick?t-lastTick:CFG.TICK_MS;lastTick=t;
+  try{process(dt);}catch(e){console.error(e);}
 }
 
-function process(){
+function process(dt){
   capx.drawImage(video,0,0,fw,fh);
   const d=capx.getImageData(0,0,fw,fh).data;
   const n=fw*fh;let mean=0;
@@ -360,7 +422,8 @@ function process(){
   lastFr=fr;
   const m={mean,diff,fr,tex:e2};
   tickN++;
-  if(!hi)armStep(m);else trackStep(m);
+  if(!shots.length){armStep(m);drawOverlay();}
+  else{trackStep(m,dt);drawOverlay();}
   if(tickN%3===0)drawMM();
 }
 
@@ -375,7 +438,7 @@ function setRing(col,txt,a,b){ring.className=col;ringT.textContent=txt||'';l1.te
 
 function armStep(m){
   const q=quality(m);
-  if(phase==='idle'){setRing(q[0],'',q[0]==='green'?'Ready: tap Start scan':q[1],q[0]==='green'?'Hold at your starting height':q[2]);return;}
+  if(phase==='idle'){setRing(q[0],'',q[0]==='green'?'Ready: tap Start scan':q[1],q[0]==='green'?'Frame the top-left corner of what you want to scan':q[2]);return;}
   if(phase==='paused'){setRing(q[0],'',q[1],q[2]);return;}
   armTicks++;if(q[0]==='green')armGood++;else armGood=0;
   const okEnough=m.mean>=CFG.DARK&&m.tex>=CFG.TEX_MIN;
@@ -384,35 +447,65 @@ function armStep(m){
 }
 
 function anchor(m){
-  hi=null;lo=null;cb=null;bx0=by0=bx1=by1=0;hiP=Math.min(P0*1.4,P0*1.4);
-  cov=new Map();Hcm=parseFloat($('hcm').value)||Hcm;
-  cx=fw/2;cy=fh/2;vx=vy=0;smSc=1;lost=false;speed=0;
-  const c=cellsFor(cx,cy,1,m.fr||1);
-  placeFrame(cx,cy,1,null);markCells(c.all,m.fr||1);
-  placed=1;flash();setUI();updateInfo();
-  say('First shot taken. Now move slowly over the surface.',4000);
+  tiles=new Map();shots=[];cb=null;cov=new Map();
+  Hcm=parseFloat($('hcm').value)||Hcm;
+  cx=fw/2;cy=fh/2;vx=vy=0;smSc=1;lost=false;failN=0;speed=0;stableN=0;
+  createAnchors();
+  const Q=m.fr||1,c=cellsFor(cx,cy,1,Q);
+  takeShot(c,Q);
+  flash();setUI();
+  say('Start points set. Now sweep slowly. If tracking is lost, return to the top-left START point.',5000);
 }
 
-function trackStep(m){
-  const wantScale=true;
-  const R=lost?100:Math.max(26,Math.round(20+Math.hypot(vx,vy)*1.6));
-  let r=doTrack(cx+(lost?0:vx),cy+(lost?0:vy),smSc,R,wantScale,lost);
+// store a shot: paint the tracking map now, keep the full-res frame as a compressed JPEG for the final stitch
+function takeShot(c,Q){
+  const allow=c.allow.length===c.n?null:c.allow;
+  const aset=allow?new Set(allow.map(a=>ck(a[0],a[1]))):null;
+  paintLo(cx,cy,smSc,aset);
+  shotCx.drawImage(video,0,0,vw,vh);
+  const th=document.createElement('canvas');th.width=96;th.height=Math.max(2,Math.round(96*fh/fw));
+  th.getContext('2d').drawImage(cap,0,0,th.width,th.height);
+  const s={x:cx,y:cy,sc:smSc,allow,th,blob:null};
+  shots.push(s);
+  shotCv.toBlob(b=>{s.blob=b;},'image/jpeg',0.88);
+  const hw=fw*smSc*(0.5-INSET),hh=fh*smSc*(0.5-INSET);
+  if(!cb)cb={x0:cx-hw,y0:cy-hh,x1:cx+hw,y1:cy+hh};
+  else{cb.x0=Math.min(cb.x0,cx-hw);cb.y0=Math.min(cb.y0,cy-hh);cb.x1=Math.max(cb.x1,cx+hw);cb.y1=Math.max(cb.y1,cy+hh);}
+  markCells(c.all,Q);placed=shots.length;updateInfo();
+}
+
+function homeHint(){
+  const tl=anchors[0];if(!tl)return 'Move back over the area you already scanned';
+  const dx=tl.gx-cx,dy=tl.gy-cy,arrows=['→','↘','↓','↙','←','↖','↑','↗'];
+  const idx=((Math.round(Math.atan2(dy,dx)/(Math.PI/4))%8)+8)%8;
+  const d=Math.hypot(dx,dy)/(fw*smSc);
+  return 'Return to the top-left START point '+arrows[idx]+(d>0.6?' (about '+d.toFixed(1)+' screens away)':'');
+}
+
+function trackStep(m,dt){
+  const R0=lost?100:Math.max(26,Math.round(20+Math.hypot(vx,vy)*1.6));
+  const R=Math.min(150,Math.round(R0*Math.max(1,dt/CFG.TICK_MS)));   // widen the search if the phone stalled for a moment
+  let r=doTrack(cx+(lost?0:vx),cy+(lost?0:vy),smSc,R,lost);
   if(r&&r.score<CFG.LOST_SCORE)r=null;
   if(!r){
-    lost=true;stableN=0;vx=vy=0;speed=0;
-    setRing('red','!','Tracking lost','Move back over the area you already scanned');
+    failN++;stableN=0;vx=vy=0;speed=0;
+    if(failN>=CFG.FAILS)lost=true;
+    if(lost&&relocalize()){lost=false;failN=0;setRing('yellow','','Found the start point','Hold steady for a moment');return;}
+    if(lost)setRing('red','!','Tracking lost',homeHint());
+    else setRing('yellow','','Tracking…','Hold steady');
     return;
   }
-  const wasLost=lost;lost=false;
+  const wasLost=lost;lost=false;failN=0;
   const nvx=r.x-cx,nvy=r.y-cy;
   speed=Math.hypot(nvx,nvy);
   vx=0.5*vx+0.5*nvx;vy=0.5*vy+0.5*nvy;
   cx=r.x;cy=r.y;
   const oldSc=smSc;
-  if(r.scaled)smSc=wasLost?r.sc:0.35*smSc+0.65*r.sc;
+  smSc=wasLost?r.sc:0.35*smSc+0.65*r.sc;
+  smSc=Math.max(CFG.MIN_SC,Math.min(CFG.MAX_SC,smSc));
   lastScore=r.score;
   if(wasLost||Math.abs(smSc/oldSc-1)>0.05)stableN=0;else stableN++;
-  smSc=Math.max(CFG.MIN_SC,Math.min(CFG.MAX_SC,smSc));
+  if(tickN%4===0)anchorCorrect();
   const tooFast=speed/smSc>CFG.SPEED*fw;
   const scaleOut=smSc<0.5||smSc>1.9;
   let col,a;
@@ -426,28 +519,60 @@ function trackStep(m){
   if(phase==='scanning'&&!tooFast&&!scaleOut&&m.fr>=CFG.FOCUS_OK&&stableN>=3&&lastScore>=0.55){
     const Q=m.fr/smSc;                       // sharper and closer is better
     const c=cellsFor(cx,cy,smSc,Q);
-    if(c.n>0&&(c.nNew+0.6*c.nBet)/c.n>=CFG.GAIN){
-      placeFrame(cx,cy,smSc,c.allow.length===c.n?null:c.allow);
-      markCells(c.all,Q);placed++;flash();updateInfo();
-    }
+    if(c.n>0&&(c.nNew+0.6*c.nBet)/c.n>=CFG.GAIN){takeShot(c,Q);flash();}
   }
+}
+
+/* ---------- Overlay: the 4 start points on the live view ---------- */
+function drawOverlay(){
+  const W=ov.clientWidth,H=ov.clientHeight;
+  if(!W||!H)return;
+  if(ov.width!==W||ov.height!==H){ov.width=W;ov.height=H;}
+  ovx.clearRect(0,0,W,H);
+  if(!anchors.length||phase==='idle')return;
+  const scr=Math.max(W/vw,H/vh),ox=(W-vw*scr)/2,oy=(H-vh*scr)/2,k=vw/fw*scr;
+  if(lost){
+    const tl=anchors[0],dx=tl.gx-cx,dy=tl.gy-cy,L=Math.hypot(dx,dy)||1,ux=dx/L,uy=dy/L;
+    const x0=W/2,y0=H/2,x1=x0+ux*Math.min(120,W*0.3),y1=y0+uy*Math.min(120,W*0.3);
+    ovx.strokeStyle='#ff3b30';ovx.fillStyle='#ff3b30';ovx.lineWidth=6;ovx.lineCap='round';
+    ovx.beginPath();ovx.moveTo(x0,y0);ovx.lineTo(x1,y1);ovx.stroke();
+    const ang=Math.atan2(uy,ux);ovx.beginPath();ovx.moveTo(x1,y1);
+    ovx.lineTo(x1-22*Math.cos(ang-0.5),y1-22*Math.sin(ang-0.5));ovx.lineTo(x1-22*Math.cos(ang+0.5),y1-22*Math.sin(ang+0.5));ovx.closePath();ovx.fill();
+    ovx.font='bold 15px -apple-system,sans-serif';ovx.textAlign='center';ovx.fillText('START',x1+ux*30,y1+uy*30);
+    return;
+  }
+  anchors.forEach((a,i)=>{
+    const lx=fw/2+(a.gx-cx)/smSc,ly=fh/2+(a.gy-cy)/smSc,X=lx*k+ox,Y=ly*k+oy;
+    if(X<-30||Y<-30||X>W+30||Y>H+30)return;
+    const home=i===0,r=home?20:13;
+    ovx.lineWidth=home?5:3;ovx.strokeStyle=home?'#34c759':'rgba(255,255,255,.85)';
+    ovx.beginPath();ovx.arc(X,Y,r,0,Math.PI*2);ovx.stroke();
+    ovx.beginPath();ovx.moveTo(X-r-5,Y);ovx.lineTo(X+r+5,Y);ovx.moveTo(X,Y-r-5);ovx.lineTo(X,Y+r+5);ovx.lineWidth=2;ovx.stroke();
+    if(home){ovx.fillStyle='#34c759';ovx.font='bold 14px -apple-system,sans-serif';ovx.textAlign='center';ovx.fillText('START',X,Y-r-10);}
+  });
 }
 
 /* ---------- Mini-map ---------- */
 function drawMM(){
   const w=mm.width,h=mm.height;
   mmx.fillStyle='#1c1c1e';mmx.fillRect(0,0,w,h);
-  if(!hi)return;
-  const W=bx1-bx0,H=by1-by0,s=Math.min(w/W,h/H);
-  mmx.drawImage(hi,0,0,hi.width,hi.height,0,0,W*s,H*s);
-  mmx.strokeStyle=lost?'#ff3b30':'#34c759';mmx.lineWidth=3;
-  const rw=fw*smSc*s,rh=fh*smSc*s;
-  mmx.strokeRect((cx-bx0)*s-rw/2,(cy-by0)*s-rh/2,rw,rh);
+  if(!shots.length||!cb)return;
+  const fhw=fw*smSc/2,fhh=fh*smSc/2;
+  const x0=Math.min(cb.x0,cx-fhw),y0=Math.min(cb.y0,cy-fhh),x1=Math.max(cb.x1,cx+fhw),y1=Math.max(cb.y1,cy+fhh);
+  const s=Math.min((w-6)/(x1-x0),(h-6)/(y1-y0));
+  const tx=(x)=>3+(x-x0)*s,ty=(y)=>3+(y-y0)*s;
+  for(const sh of shots){
+    const hw=fw*sh.sc*(0.5-INSET),hh=fh*sh.sc*(0.5-INSET),t=sh.th;
+    mmx.drawImage(t,t.width*INSET,t.height*INSET,t.width*(1-2*INSET),t.height*(1-2*INSET),tx(sh.x-hw),ty(sh.y-hh),2*hw*s,2*hh*s);
+  }
+  anchors.forEach((a,i)=>{mmx.fillStyle=i===0?'#34c759':'#fff';mmx.beginPath();mmx.arc(tx(a.gx),ty(a.gy),i===0?5:3,0,Math.PI*2);mmx.fill();});
+  mmx.strokeStyle=lost?'#ff3b30':'#34c759';mmx.lineWidth=2;
+  mmx.strokeRect(tx(cx-fhw),ty(cy-fhh),2*fhw*s,2*fhh*s);
 }
 function updateInfo(){
-  if(cb)$('mmInfo').textContent=placed+' shots · '+Math.round((cb.x1-cb.x0)*hiP)+'×'+Math.round((cb.y1-cb.y0)*hiP);
+  if(cb)$('mmInfo').textContent=shots.length+' shots · '+Math.round((cb.x1-cb.x0)*P0)+'×'+Math.round((cb.y1-cb.y0)*P0);
   else $('mmInfo').textContent='map';
-  bFinish.hidden=!hi;bReset.hidden=!hi;bFinish.textContent='Finish ('+placed+')';
+  bFinish.hidden=!shots.length;bReset.hidden=!shots.length;bFinish.textContent='Finish ('+shots.length+')';
 }
 
 /* ---------- UI / buttons ---------- */
@@ -455,44 +580,90 @@ function setUI(){
   if(phase==='idle'){bMain.textContent='Start scan';bMain.className='go';}
   else if(phase==='scanning'){bMain.textContent='Pause';bMain.className='';}
   else if(phase==='paused'){bMain.textContent='Resume';bMain.className='go';}
-  bFinish.className=hi?'go':'';
-  bFinish.textContent='Finish ('+placed+')';
+  bFinish.className=shots.length?'go':'';
   updateInfo();
 }
 bMain.onclick=()=>{
-  if(phase==='idle'){phase='scanning';armGood=0;armTicks=0;say('Hold steady for a moment, then move slowly.',3500);}
+  if(phase==='idle'){phase='scanning';armGood=0;armTicks=0;say('Hold steady a moment, with the top-left of your area in view.',3500);}
   else if(phase==='scanning')phase='paused';
   else if(phase==='paused'){phase='scanning';armGood=0;armTicks=0;}
   setUI();
 };
 bReset.onclick=()=>{if(confirm('Discard this scan and start over?'))resetAll();};
-function resetAll(){hi=lo=null;cb=null;cov=new Map();placed=0;stableN=0;phase='idle';lost=false;armGood=0;armTicks=0;focusRef=1e-6;smSc=1;show('scan');setUI();drawMM();}
+function resetAll(){
+  tiles=new Map();shots=[];anchors=[];cb=null;cov=new Map();rawOut=null;placed=0;stableN=0;failN=0;
+  phase='idle';lost=false;armGood=0;armTicks=0;focusRef=1e-6;smSc=1;
+  show('scan');setUI();drawMM();drawOverlay();
+}
 bFinish.onclick=()=>{
-  if(!hi||!cb)return;
+  if(!shots.length||!cb)return;
   if(phase==='scanning'&&!lost&&stableN>=2&&lastFr>=CFG.FOCUS_WARN){   // final shot so the last stretch isn't left out
     const Q=lastFr/smSc,c=cellsFor(cx,cy,smSc,Q);
-    if(c.n>0&&c.nNew>0){placeFrame(cx,cy,smSc,c.allow.length===c.n?null:c.allow);markCells(c.all,Q);placed++;}
+    if(c.n>0&&c.nNew>0)takeShot(c,Q);
   }
-  phase='done';show('result');buildResult();};
+  phase='done';show('result');compose();
+};
 
-/* ---------- Result / export ---------- */
-let jpgBlob=null,pdfBlob=null,rUrl=null;
-async function buildResult(){
-  $('info').textContent='Rendering…';
-  const sx=Math.max(0,Math.floor((cb.x0-bx0)*hiP)),sy=Math.max(0,Math.floor((cb.y0-by0)*hiP));
-  const w=Math.min(hi.width-sx,Math.ceil((cb.x1-cb.x0)*hiP)),h=Math.min(hi.height-sy,Math.ceil((cb.y1-cb.y0)*hiP));
-  const out=document.createElement('canvas');out.width=w;out.height=h;
-  const o=out.getContext('2d');o.fillStyle='#fff';o.fillRect(0,0,w,h);
-  o.drawImage(hi,sx,sy,w,h,0,0,w,h);
-  if($('enh').checked)enhance(out);
-  jpgBlob=await new Promise(r=>out.toBlob(r,'image/jpeg',0.92));
-  const bytes=new Uint8Array(await jpgBlob.arrayBuffer());
-  pdfBlob=makePDF(bytes,w,h);
-  if(rUrl)URL.revokeObjectURL(rUrl);
-  rUrl=URL.createObjectURL(jpgBlob);$('rimg').src=rUrl;
-  $('info').textContent=w+' × '+h+' px · '+(jpgBlob.size/1048576).toFixed(1)+' MB';
+/* ---------- Final stitch (from stored shots, memory-safe) ---------- */
+let rawOut=null,jpgBlob=null,pdfBlob=null,rUrl=null,composeId=0;
+async function decode(b){
+  if(typeof createImageBitmap==='function'){try{return await createImageBitmap(b);}catch(e){}}
+  return await new Promise((res,rej)=>{const im=new Image(),u=URL.createObjectURL(b);im.onload=()=>{URL.revokeObjectURL(u);res(im);};im.onerror=rej;im.src=u;});
 }
-$('enh').onchange=()=>buildResult();
+function blitHi(ctx,scale,ox,oy,src,SW,SH,s){
+  const sx=SW*INSET,sy=SH*INSET,sw=SW*(1-2*INSET),sh=SH*(1-2*INSET);
+  const ux=s.x-fw*s.sc*(0.5-INSET),uy=s.y-fh*s.sc*(0.5-INSET),uw=fw*s.sc*(1-2*INSET),uh=fh*s.sc*(1-2*INSET);
+  const dx=(ux-ox)*scale,dy=(uy-oy)*scale,dw=uw*scale,dh=uh*scale;
+  ctx.globalCompositeOperation='destination-over';   // fill only empty areas with the whole tile
+  ctx.drawImage(src,sx,sy,sw,sh,dx,dy,dw,dh);
+  ctx.globalCompositeOperation='source-over';
+  if(s.allow&&!s.allow.length)return;
+  const tw=Math.max(2,Math.ceil(dw)),th=Math.max(2,Math.ceil(dh));
+  tmpH.width=tw;tmpH.height=th;                       // feathered copy blends over what is already there
+  tmpHx.drawImage(src,sx,sy,sw,sh,0,0,tw,th);
+  tmpHx.globalCompositeOperation='destination-in';
+  tmpHx.drawImage(mask,0,0,tw,th);
+  tmpHx.globalCompositeOperation='source-over';
+  if(s.allow){
+    ctx.save();ctx.beginPath();
+    for(const c of s.allow)ctx.rect((c[0]*cs-ox)*scale,(c[1]*cs-oy)*scale,cs*scale,cs*scale);
+    ctx.clip();ctx.drawImage(tmpH,dx,dy,dw,dh);ctx.restore();
+  }else ctx.drawImage(tmpH,dx,dy,dw,dh);
+}
+async function compose(){
+  const id=++composeId;
+  $('rimg').removeAttribute('src');jpgBlob=pdfBlob=null;rawOut=null;
+  $('info').textContent='Stitching…';
+  while(shots.some(s=>!s.blob))await sleep(40);
+  const W=cb.x1-cb.x0,H=cb.y1-cb.y0;let minSc=1;for(const s of shots)minSc=Math.min(minSc,s.sc);
+  const P=Math.min(P0/Math.max(0.7,minSc),Math.sqrt(CFG.MAXOUT/(W*H)));
+  const w=Math.max(2,Math.ceil(W*P)),h=Math.max(2,Math.ceil(H*P));
+  const out=document.createElement('canvas');out.width=w;out.height=h;
+  const o=out.getContext('2d');
+  for(let i=0;i<shots.length;i++){
+    if(id!==composeId)return;
+    const bmp=await decode(shots[i].blob);
+    blitHi(o,P,cb.x0,cb.y0,bmp,bmp.width,bmp.height,shots[i]);
+    if(bmp.close)bmp.close();
+    if(i%2===0){$('info').textContent='Stitching '+(i+1)+' / '+shots.length;await sleep(0);}
+  }
+  o.globalCompositeOperation='destination-over';o.fillStyle='#fff';o.fillRect(0,0,w,h);o.globalCompositeOperation='source-over';
+  rawOut=out;
+  await exportOut();
+}
+async function exportOut(){
+  if(!rawOut)return;
+  let c=rawOut;
+  if($('enh').checked){c=document.createElement('canvas');c.width=rawOut.width;c.height=rawOut.height;c.getContext('2d').drawImage(rawOut,0,0);enhance(c);}
+  $('info').textContent='Saving…';
+  const jb=await new Promise(r=>c.toBlob(r,'image/jpeg',0.92));
+  const bytes=new Uint8Array(await jb.arrayBuffer());
+  jpgBlob=jb;pdfBlob=makePDF(bytes,c.width,c.height);
+  if(rUrl)URL.revokeObjectURL(rUrl);
+  rUrl=URL.createObjectURL(jb);$('rimg').src=rUrl;
+  $('info').textContent=c.width+' × '+c.height+' px · '+(jb.size/1048576).toFixed(1)+' MB · '+shots.length+' shots';
+}
+$('enh').onchange=()=>exportOut();
 
 function enhance(c){
   const x=c.getContext('2d'),im=x.getImageData(0,0,c.width,c.height),d=im.data;
@@ -539,8 +710,8 @@ function saveBlob(blob,name){            // must be called straight from a tap
 const stamp=()=>{const d=new Date(),p=n=>String(n).padStart(2,'0');return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+'-'+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds());};
 $('saveJpg').onclick=()=>saveBlob(jpgBlob,'scan-'+stamp()+'.jpg');
 $('savePdf').onclick=()=>saveBlob(pdfBlob,'scan-'+stamp()+'.pdf');
-$('more').onclick=()=>{phase='paused';lost=true;show('scan');setUI();say('Move back over the scanned area, then tap Resume.',4000);};
-$('newScan').onclick=()=>{if(confirm('Discard this scan and start a new one?'))resetAll();};
+$('more').onclick=()=>{composeId++;rawOut=null;phase='paused';lost=true;failN=CFG.FAILS;show('scan');setUI();say('Return to the START point or any scanned area, then tap Resume.',4500);};
+$('newScan').onclick=()=>{if(confirm('Discard this scan and start a new one?')){composeId++;resetAll();}};
 
 })();
 </script>
