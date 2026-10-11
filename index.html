@@ -152,6 +152,7 @@ let cov=new Map(),cs=64;
 let tiles=new Map();                 // sparse tracking map: gray + valid per tile, no size limit
 let shots=[];                        // stored shots {x,y,sc,allow,th,blob}
 let anchors=[];                      // 4 start points with persistent reference patches
+let keys=[];                         // invisible tracking points: one crisp reference patch per picture taken
 let mg=null,mv=null,gw=0,gh=0,rx0=0,ry0=0;
 let lastTick=0,torchOn=false;
 
@@ -339,6 +340,39 @@ function cornerHint(){
   const n=anchors.length;
   return n<4?'Corner '+(n+1)+' of 4: put the target on the '+CORNER_DESC[n]+' corner, then tap Place corner':'All 4 corners set. Tap Start scan';
 }
+// every picture taken leaves behind an invisible tracking point: the most textured patch near the view centre,
+// stored permanently in map coordinates. They are used to correct drift and to find your place again after tracking is lost.
+function addKey(){
+  if(keys.length>=3000)return;
+  const ext=PH/smSc+2;
+  let best=-1,bdx=0,bdy=0;
+  for(let dy=-24;dy<=24;dy+=12)for(let dx=-40;dx<=40;dx+=20){
+    const lx=fw/2+dx,ly=fh/2+dy;
+    if(lx<ext||lx>fw-1-ext||ly<ext||ly>fh-1-ext)continue;
+    let s=0,s2=0;
+    for(let i=0;i<PN;i++){const v=g[Math.round(ly+pty[i]/smSc)*fw+Math.round(lx+ptx[i]/smSc)];s+=v;s2+=v*v;}
+    const va=s2/PN-(s/PN)*(s/PN);if(va>best){best=va;bdx=dx;bdy=dy;}
+  }
+  if(best<16)return;                       // too flat to be a useful reference
+  const lx=fw/2+bdx,ly=fh/2+bdy,pv=new Uint8Array(PN);
+  for(let i=0;i<PN;i++)pv[i]=g[Math.round(ly+pty[i]/smSc)*fw+Math.round(lx+ptx[i]/smSc)];
+  keys.push({gx:cx+bdx*smSc,gy:cy+bdy*smSc,pv});
+}
+// the start points plus the few invisible points closest to the middle of the view
+function correctionCands(){
+  const out=anchors.slice();
+  if(keys.length){
+    const vis=[];
+    for(const k of keys){
+      const lx=fw/2+(k.gx-cx)/smSc,ly=fh/2+(k.gy-cy)/smSc;
+      if(lx<PH+6||lx>fw-PH-6||ly<PH+6||ly>fh-PH-6)continue;
+      vis.push([(lx-fw/2)*(lx-fw/2)+(ly-fh/2)*(ly-fh/2),k]);
+    }
+    vis.sort((a,b)=>a[0]-b[0]);
+    for(let i=0;i<Math.min(4,vis.length);i++)out.push(vis[i][1]);
+  }
+  return out;
+}
 // find anchor patch in the live gray image around (lx0,ly0)
 function matchAnchor(a,lx0,ly0,Rx,Ry,step,scs,pstep){
   let best={score:-2,lx:lx0,ly:ly0,s:scs[0]};
@@ -368,12 +402,19 @@ const fromAnchor=(a,m)=>({x:a.gx-(m.lx-fw/2)*m.s,y:a.gy-(m.ly-fh/2)*m.s,s:m.s});
 // tracking lost: look for the home point (and one other start point per tick) anywhere in the live view
 function relocalize(){
   if(!anchors.length)return false;
-  const order=[0];if(anchors.length>1)order.push(1+(relocIdx++%(anchors.length-1)));
+  // candidates: home, the invisible point nearest to where tracking was last good, and two more taken in rotation
+  const cands=[[anchors[0],3]];
+  const pool=anchors.slice(1).concat(keys);
+  if(keys.length){
+    let n1=null,nd=1e18;
+    for(const k of keys){const d=(k.gx-cx)*(k.gx-cx)+(k.gy-cy)*(k.gy-cy);if(d<nd){nd=d;n1=k;}}
+    cands.push([n1,4]);
+  }
+  for(let j=0;j<(keys.length?2:1)&&pool.length;j++)cands.push([pool[relocIdx++%pool.length],keys.length?4:3]);
   const scs=[0.88,0.94,1,1.06,1.12].map(k=>smSc*k).filter(s=>s>=CFG.MIN_SC&&s<=CFG.MAX_SC);
   let bA=null,bM=null;
-  for(const ai of order){
-    const a=anchors[ai];
-    const m=matchAnchor(a,fw/2,fh/2,Math.floor(fw/2-PH-4),Math.floor(fh/2-PH-4),3,scs,2);
+  for(const [a,st] of cands){
+    const m=matchAnchor(a,fw/2,fh/2,Math.floor(fw/2-PH-4),Math.floor(fh/2-PH-4),st,scs,2);
     if(!bM||m.score>bM.score){bM=m;bA=a;}
   }
   if(!bM||bM.score<0.55)return false;
@@ -384,7 +425,7 @@ function relocalize(){
 // while tracking: use any visible start point to remove drift (gently)
 function anchorCorrect(){
   let bA=null,bM=null;
-  for(const a of anchors){
+  for(const a of correctionCands()){
     const lx=fw/2+(a.gx-cx)/smSc,ly=fh/2+(a.gy-cy)/smSc;
     if(lx<PH+6||lx>fw-PH-6||ly<PH+6||ly>fh-PH-6)continue;
     const m=matchAnchor(a,lx,ly,8,8,2,[smSc*0.97,smSc,smSc*1.03],2);
@@ -463,7 +504,7 @@ function placeFirstCorner(){
   const m=lastM;if(!m||!g)return;
   const q=quality(m);
   if(q[0]==='red'){say(q[1]+': '+q[2]);return;}
-  tiles=new Map();shots=[];cb=null;cov=new Map();mcov=new Map();anchors=[];
+  tiles=new Map();shots=[];cb=null;cov=new Map();mcov=new Map();anchors=[];keys=[];
   Hcm=parseFloat($('hcm').value)||Hcm;
   cx=fw/2;cy=fh/2;vx=vy=0;smSc=1;lost=false;failN=0;speed=0;stableN=0;lastScore=1;
   const c=cellsFor(cx,cy,1,1,mcov);
@@ -494,7 +535,7 @@ function takeShot(c,Q){
   const hw=fw*smSc*(0.5-INSET),hh=fh*smSc*(0.5-INSET);
   if(!cb)cb={x0:cx-hw,y0:cy-hh,x1:cx+hw,y1:cy+hh};
   else{cb.x0=Math.min(cb.x0,cx-hw);cb.y0=Math.min(cb.y0,cy-hh);cb.x1=Math.max(cb.x1,cx+hw);cb.y1=Math.max(cb.y1,cy+hh);}
-  markCells(c.all,Q);placed=shots.length;updateInfo();
+  markCells(c.all,Q);placed=shots.length;addKey();updateInfo();
 }
 
 function homeHint(){
@@ -551,7 +592,7 @@ function trackStep(m,dt){
       const c=cellsFor(cx,cy,smSc,1,mcov);
       if(c.n>0&&c.nNew/c.n>=0.12){
         const aset=c.allow.length===c.n?null:new Set(c.allow.map(q=>ck(q[0],q[1])));
-        paintLo(cx,cy,smSc,aset);markCells(c.all,1,mcov);
+        paintLo(cx,cy,smSc,aset);markCells(c.all,1,mcov);addKey();
       }
     }
     return;
@@ -681,7 +722,7 @@ bUndo.onclick=()=>{
 };
 bReset.onclick=()=>{if(!shots.length||confirm('Discard this scan and start over?'))resetAll();};
 function resetAll(){
-  tiles=new Map();shots=[];anchors=[];cb=null;cov=new Map();mcov=new Map();rawOut=null;placed=0;stableN=0;failN=0;
+  tiles=new Map();shots=[];anchors=[];keys=[];cb=null;cov=new Map();mcov=new Map();rawOut=null;placed=0;stableN=0;failN=0;
   origin=false;endSnap();
   phase='idle';lost=false;armGood=0;armTicks=0;focusRef=1e-6;smSc=1;
   show('scan');setUI();drawMM();drawOverlay();
