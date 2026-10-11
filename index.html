@@ -140,6 +140,7 @@ const CORNER_NAMES=['TL','TR','BR','BL'],CORNER_DESC=['top-left','top-right','bo
 
 let stream=null,vtrack=null,phase='idle',wake=null;   // idle | setup (placing corners) | scanning | paused | done
 let origin=false,mcov=new Map(),lastM=null,snapReq=0;
+let dcx=0,dcy=0,dsc=1,dInit=false;     // eased pose used only for drawing, so the markers don't jump between tracker ticks
 let vw=0,vh=0,fw=0,fh=0,P0=1,HX=0,HY=0,N=0,FC=256;
 const cap=document.createElement('canvas'),capx=cap.getContext('2d',{willReadFrequently:true});
 const fcv=document.createElement('canvas'),fcx=fcv.getContext('2d',{willReadFrequently:true});
@@ -398,6 +399,11 @@ function anchorCorrect(){
 /* ---------- Per-frame processing ---------- */
 function loop(t){
   requestAnimationFrame(loop);
+  if(origin&&phase!=='done'&&g){          // ease the drawn pose toward the latest tracked pose every frame
+    if(!dInit||Math.hypot(cx-dcx,cy-dcy)>60*smSc||lost){dcx=cx;dcy=cy;dsc=smSc;dInit=true;}
+    else{dcx+=(cx-dcx)*0.4;dcy+=(cy-dcy)*0.4;dsc+=(smSc-dsc)*0.25;}
+    drawOverlay();
+  }
   if(phase==='done'||!g||video.readyState<2||t-lastTick<CFG.TICK_MS)return;
   const dt=lastTick?t-lastTick:CFG.TICK_MS;lastTick=t;
   try{process(dt);}catch(e){console.error(e);}
@@ -468,11 +474,10 @@ function placeFirstCorner(){
   say(va<4?'Little detail at this corner: it will work as a marker but cannot help recover lost tracking.':'Corner 1 (home) set. Move to the top-right corner at the same height.',4500);
 }
 function placeNextCorner(){
-  if(!origin||lost||failN>0||lastScore<0.55||!lastM){say('Wait until the ring is green (tracking), then place the corner.');return;}
-  if(lastM.fr<CFG.FOCUS_WARN){say('Out of focus: hold still, then place the corner.');return;}
-  const va=addCorner();
+  if(!origin||lost||failN>0||lastScore<0.45||!lastM){say('Tracking lost: move back over the area you already passed, then place the corner.');return;}
+  const va=addCorner();                      // works whenever tracking holds, even if the ring is yellow
   flash();setUI();
-  say(va<4?'Little detail at this corner: it is a marker only.':cornerHint(),3500);
+  say(va<4?'Little detail at this corner: it is a marker only.':lastM.fr<CFG.FOCUS_WARN?'Corner placed (a bit blurry).':cornerHint(),3500);
 }
 
 // store a shot: paint the tracking map now, keep the full-res frame as a compressed JPEG for the final stitch
@@ -519,7 +524,9 @@ function trackStep(m,dt){
   vx=0.5*vx+0.5*nvx;vy=0.5*vy+0.5*nvy;
   cx=r.x;cy=r.y;
   const oldSc=smSc;
-  smSc=wasLost?r.sc:0.35*smSc+0.65*r.sc;
+  if(wasLost)smSc=r.sc;
+  else if(phase==='setup'){if(Math.abs(r.sc/smSc-1)>0.03)smSc=0.8*smSc+0.2*r.sc;}   // setup: ignore small scale noise, follow big changes slowly
+  else smSc=0.35*smSc+0.65*r.sc;
   smSc=Math.max(CFG.MIN_SC,Math.min(CFG.MAX_SC,smSc));
   lastScore=r.score;
   if(wasLost||Math.abs(smSc/oldSc-1)>0.05)stableN=0;else stableN++;
@@ -527,7 +534,12 @@ function trackStep(m,dt){
   const tooFast=speed/smSc>CFG.SPEED*fw;
   const scaleOut=smSc<0.5||smSc>1.9;
   let col,a;
-  if(phase==='paused'){col='yellow';a='Paused';}
+  if(phase==='setup'){                      // never red while placing corners: tracking is what matters here
+    if(m.fr<CFG.FOCUS_WARN){col='yellow';a='Hold still to focus';}
+    else if(tooFast){col='yellow';a='Slow down';}
+    else{col='green';a='Tracking';}
+  }
+  else if(phase==='paused'){col='yellow';a='Paused';}
   else if(m.fr<CFG.FOCUS_WARN){col='red';a='Out of focus';}
   else if(tooFast){col='yellow';a='Slow down';}
   else if(scaleOut){col='yellow';a=smSc<0.5?'Too close to start height':'Too far from start height';}
@@ -535,9 +547,9 @@ function trackStep(m,dt){
   else{col='green';a=phase==='setup'?'Tracking':snapReq?'Snapping…':'Capturing';}
   setRing(col,Math.round(smSc*100)+'%',a,phase==='setup'?cornerHint():'Height ≈ '+(Hcm*smSc).toFixed(0)+' cm · '+placed+' shots');
   if(phase==='setup'){                      // map-only painting so tracking survives the walk between corners
-    if(!tooFast&&!scaleOut&&m.fr>=CFG.FOCUS_OK&&stableN>=3&&lastScore>=0.55){
+    if(speed/smSc<=CFG.SPEED*fw*2&&m.fr>=CFG.FOCUS_WARN&&stableN>=1&&lastScore>=0.5){   // paint often and loosely so the map keeps up with you
       const c=cellsFor(cx,cy,smSc,1,mcov);
-      if(c.n>0&&c.nNew/c.n>=CFG.GAIN){
+      if(c.n>0&&c.nNew/c.n>=0.12){
         const aset=c.allow.length===c.n?null:new Set(c.allow.map(q=>ck(q[0],q[1])));
         paintLo(cx,cy,smSc,aset);markCells(c.all,1,mcov);
       }
@@ -581,7 +593,7 @@ function drawOverlay(){
     ovx.font='bold 15px -apple-system,sans-serif';ovx.textAlign='center';ovx.fillText('START',x1+ux*30,y1+uy*30);
     return;
   }
-  const pts=anchors.map(a=>[(fw/2+(a.gx-cx)/smSc)*k+ox,(fh/2+(a.gy-cy)/smSc)*k+oy]);
+  const pts=anchors.map(a=>[(fw/2+(a.gx-dcx)/dsc)*k+ox,(fh/2+(a.gy-dcy)/dsc)*k+oy]);
   if(pts.length>1){                         // outline of the area
     ovx.strokeStyle='rgba(255,255,255,.6)';ovx.lineWidth=2;ovx.setLineDash([8,6]);
     ovx.beginPath();pts.forEach((p,i)=>i?ovx.lineTo(p[0],p[1]):ovx.moveTo(p[0],p[1]));
