@@ -57,7 +57,7 @@ button[hidden]{display:none}
 
 <div id="intro" class="screen on">
   <h1>Wand Scan</h1>
-  <p>Scan documents, posters or any flat surface with your iPhone camera. First mark the four corners of the area by hand, then tap Start scan and slowly move the phone over the surface. The app decides on its own when to take each shot (sharp, steady, and covering new area) and stitches them into one image. Tap <b>Snap now</b> any time to force a shot within a few seconds.</p>
+  <p>Scan documents, posters or any flat surface with your iPhone camera. The app follows your phone in 3D (slide, height, tilt and turn, using the motion sensors: tap <b>Allow</b> when asked) and flattens every picture onto the surface. First mark the four corners of the area by hand, then tap Start scan and slowly move the phone over the surface. The app decides on its own when to take each shot (sharp, steady, and covering new area) and stitches them into one image. Tap <b>Snap now</b> any time to force a shot within a few seconds.</p>
   <label>Phone height above the surface (cm, rough guess)
     <input id="hcm" type="number" value="20" min="8" max="80" inputmode="decimal"></label>
   <ul>
@@ -130,7 +130,9 @@ const CFG={
   ARM_TICKS:30,       // give up waiting for perfect first shot after this many ticks
   CELL:0.2,           // coverage cell size (fraction of frame width)
   TILE:128,           // tracking-map tile size (units)
-  MIN_SC:0.4, MAX_SC:2.4
+  MIN_SC:0.4, MAX_SC:2.4,
+  FOV:65,             // camera field of view along the long edge of the picture (degrees); used to turn tilt/turn into image warps
+  MAX_TILT:30         // don't take pictures when the phone is tilted more than this away from the start orientation
 };
 
 const $=id=>document.getElementById(id);
@@ -165,6 +167,8 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 $('open').onclick=async()=>{
   if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){alert('Camera not available. Open this page over https in Safari.');return;}
   Hcm=parseFloat($('hcm').value)||20;
+  let motionP=Promise.resolve('granted');       // iOS only shows the motion-sensor prompt when asked straight from the tap
+  try{if(typeof DeviceOrientationEvent!=='undefined'&&typeof DeviceOrientationEvent.requestPermission==='function')motionP=DeviceOrientationEvent.requestPermission().catch(()=>'denied');}catch(e){}
   try{
     stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30}}});
   }catch(e){alert('Could not open camera: '+e.message+'\nAllow camera access for this site and make sure it is served over https.');return;}
@@ -183,6 +187,9 @@ $('open').onclick=async()=>{
   init();
   phase='idle';setUI();
   requestAnimationFrame(loop);
+  const perm=await motionP;
+  if(perm!=='granted')say('Motion sensors not allowed: tilt and up/down turning are not tracked, only sliding and spinning on the surface.',6000);
+  else setTimeout(()=>{if(!gyroOK)say('No motion sensor data: tilt is not tracked, only sliding and spinning on the surface.',6000);},2500);
 };
 bTorch.onclick=async()=>{torchOn=!torchOn;try{await vtrack.applyConstraints({advanced:[{torch:torchOn}]});}catch(e){say('Torch not supported here');torchOn=false;}};
 
@@ -197,7 +204,9 @@ function initGeometry(){
   const ox=[],oy=[],gi=[];
   const c0x=fw>>1,c0y=fh>>1;
   for(let y=-HY;y<=HY;y+=2)for(let x=-HX;x<=HX;x+=2){ox.push(x);oy.push(y);gi.push((c0y+y)*fw+(c0x+x));}
-  N=ox.length;tox=Int16Array.from(ox);toy=Int16Array.from(oy);gidx=Int32Array.from(gi);ta=new Uint8Array(N);
+  N=ox.length;tox=Int16Array.from(ox);toy=Int16Array.from(oy);gidx=Int32Array.from(gi);ta=new Uint8Array(N);tv=new Uint8Array(N);
+  FL=(Math.max(fw,fh)/2)/Math.tan(CFG.FOV*Math.PI/360);
+  gr=new Uint8Array(fw*fh);grv=new Uint8Array(fw*fh);
   cs=Math.max(8,Math.round(fw*CFG.CELL));
   const mw=64,mh=Math.max(8,Math.round(64*fh/fw));         // feather mask
   mask=document.createElement('canvas');mask.width=mw;mask.height=mh;
@@ -211,6 +220,84 @@ function initGeometry(){
 
 const INSET=0.05;
 
+/* ---------- 3D camera pose: phone motion sensors give tilt + turn; the tracker gives slide + height ----------
+   Every live frame is re-rendered as if the phone still had its starting orientation ("rectified"), so the
+   tracker only has to find slide, height and a small leftover turn, and every picture lands on the map flat. */
+const ID3=[1,0,0,0,1,0,0,0,1];
+const mmul=(A,B)=>[
+  A[0]*B[0]+A[1]*B[3]+A[2]*B[6],A[0]*B[1]+A[1]*B[4]+A[2]*B[7],A[0]*B[2]+A[1]*B[5]+A[2]*B[8],
+  A[3]*B[0]+A[4]*B[3]+A[5]*B[6],A[3]*B[1]+A[4]*B[4]+A[5]*B[7],A[3]*B[2]+A[4]*B[5]+A[5]*B[8],
+  A[6]*B[0]+A[7]*B[3]+A[8]*B[6],A[6]*B[1]+A[7]*B[4]+A[8]*B[7],A[6]*B[2]+A[7]*B[5]+A[8]*B[8]];
+const mT=A=>[A[0],A[3],A[6],A[1],A[4],A[7],A[2],A[5],A[8]];
+const Rzm=a=>{const c=Math.cos(a),s=Math.sin(a);return [c,-s,0,s,c,0,0,0,1];};
+const angBetween=(A,B)=>{let t=0;for(let i=0;i<9;i++)t+=A[i]*B[i];return Math.acos(Math.max(-1,Math.min(1,(t-1)/2)));};
+let orient=null,gyroOK=false,Rref=null,psi=0,Mt=ID3,Mn=ID3,Mraw=ID3,prevRaw=null,FL=250;
+let gr=null,grv=null,tv=null;          // rectified gray frame, its validity mask, and the tracker template's validity
+window.addEventListener('deviceorientation',e=>{if(e.beta==null)return;orient={a:e.alpha||0,b:e.beta,g:e.gamma||0};gyroOK=true;});
+function screenTheta(){                 // how the screen is turned relative to the phone body (video follows the screen)
+  let a=typeof window.orientation==='number'?window.orientation:(screen.orientation&&typeof screen.orientation.angle==='number'?-screen.orientation.angle:0);
+  a=(((a+180)%360)+360)%360-180;
+  if(vh>vw)return Math.abs(a)>90?Math.PI:0;
+  return a<0?-Math.PI/2:Math.PI/2;
+}
+function camR(){                        // rotation of the camera in the world (camera x right, y down, z forward)
+  if(!orient)return null;
+  const d=Math.PI/180,ca=Math.cos(orient.a*d),sa=Math.sin(orient.a*d),cb=Math.cos(orient.b*d),sb=Math.sin(orient.b*d),cg=Math.cos(orient.g*d),sg=Math.sin(orient.g*d);
+  const Rdev=mmul(mmul([ca,-sa,0,sa,ca,0,0,0,1],[1,0,0,0,cb,-sb,0,sb,cb]),[cg,0,sg,0,1,0,-sg,0,cg]);
+  const th=screenTheta(),c=Math.cos(th),s=Math.sin(th);
+  return mmul(Rdev,[c,-s,0,-s,-c,0,0,0,-1]);
+}
+// The surface is assumed to be square-on to the phone at the start. If the phone is already close to looking straight
+// down (a table) or straight ahead (a wall), snap to exactly that, so a slightly crooked start doesn't skew the scan.
+function levelRef(R){
+  if(!R)return R;
+  const D=Math.PI/180,f=[R[2],R[5],R[8]];
+  let t=null;
+  if(f[2]<-Math.cos(25*D))t=[0,0,-1];
+  else if(Math.abs(f[2])<Math.sin(20*D)){const h=Math.hypot(f[0],f[1])||1;t=[f[0]/h,f[1]/h,0];}
+  if(!t)return R;
+  const a=[f[1]*t[2]-f[2]*t[1],f[2]*t[0]-f[0]*t[2],f[0]*t[1]-f[1]*t[0]],c=f[0]*t[0]+f[1]*t[1]+f[2]*t[2];
+  if(c<-0.999)return R;
+  const K=[0,-a[2],a[1],a[2],0,-a[0],-a[1],a[0],0],K2=mmul(K,K),k=1/(1+c);
+  const Rr=[1+K[0]+K2[0]*k,K[1]+K2[1]*k,K[2]+K2[2]*k,K[3]+K2[3]*k,1+K[4]+K2[4]*k,K[5]+K2[5]*k,K[6]+K2[6]*k,K[7]+K2[7]*k,1+K[8]+K2[8]*k];
+  return mmul(Rr,R);
+}
+const rawM=()=>{const R=Rref?camR():null;return R?mmul(mT(R),Rref):ID3;};   // start-orientation ray -> current camera ray
+const withPsi=m=>psi?mmul(m,Rzm(psi)):m;
+// re-render the live frame in the start orientation
+function rectify(){
+  const m=Mt,cxp=fw/2,cyp=fh/2,inv=1/FL,xa=fw*INSET,xb=fw*(1-INSET),ya=fh*INSET,yb=fh*(1-INSET);
+  let i=0;
+  for(let y=0;y<fh;y++){
+    const ry=(y+0.5-cyp)*inv;
+    for(let x=0;x<fw;x++,i++){
+      const rx=(x+0.5-cxp)*inv,Z=m[6]*rx+m[7]*ry+m[8];
+      if(Z<0.05){grv[i]=0;gr[i]=0;continue;}
+      const iz=FL/Z,u=cxp+(m[0]*rx+m[1]*ry+m[2])*iz,v=cyp+(m[3]*rx+m[4]*ry+m[5])*iz;
+      if(u<xa||u>xb||v<ya||v>yb){grv[i]=0;gr[i]=0;continue;}
+      const uu=u-0.5,vv=v-0.5,x0=Math.floor(uu),y0=Math.floor(vv),ax=uu-x0,ay=vv-y0,j=y0*fw+x0;
+      gr[i]=((g[j]*(1-ax)+g[j+1]*ax)*(1-ay)+(g[j+fw]*(1-ax)+g[j+fw+1]*ax)*ay+0.5)|0;grv[i]=1;
+    }
+  }
+}
+// where a map point shows up in the live view (tracking px), or null when it is behind the camera
+function mapToLive(m,gx,gy,pcx,pcy,psc){
+  const rx=(gx-pcx)/psc/FL,ry=(gy-pcy)/psc/FL,Z=m[6]*rx+m[7]*ry+m[8];
+  if(Z<0.05)return null;
+  const iz=FL/Z;return [fw/2+(m[0]*rx+m[1]*ry+m[2])*iz,fh/2+(m[3]*rx+m[4]*ry+m[5])*iz];
+}
+// where the real optical axis meets the surface, in rectified-frame px (the on-screen target)
+function liveCenterRef(){const w=Mt[8];if(w<0.2)return [fw/2,fh/2];return [fw/2+FL*Mt[6]/w,fh/2+FL*Mt[7]/w];}
+// the four corners of a picture's usable area, on the map
+function quadOf(m,x,y,sc){
+  const out=[];
+  for(const [fx,fy] of [[INSET,INSET],[1-INSET,INSET],[1-INSET,1-INSET],[INSET,1-INSET]]){
+    const rx=(fx*fw-fw/2)/FL,ry=(fy*fh-fh/2)/FL,Z=Math.max(0.05,m[2]*rx+m[5]*ry+m[8]),iz=FL/Z;
+    out.push([x+(m[0]*rx+m[3]*ry+m[6])*iz*sc,y+(m[1]*rx+m[4]*ry+m[7])*iz*sc]);
+  }
+  return out;
+}
+
 /* ---------- Coverage grid (best shot quality per cell) ---------- */
 const ck=(i,j)=>(i+20000)*40000+(j+20000);
 function cellsFor(px,py,sc,Q,cm=cov,force=false){
@@ -220,6 +307,8 @@ function cellsFor(px,py,sc,Q,cm=cov,force=false){
   for(let j=j0;j<=j1;j++)for(let i=i0;i<=i1;i++){
     const ux=(i+0.5)*cs,uy=(j+0.5)*cs;
     if(ux<px-hw||ux>px+hw||uy<py-hh||uy>py+hh)continue;
+    const ra=Math.floor((ux-px)/sc+fw/2),rb=Math.floor((uy-py)/sc+fh/2);       // is this cell really inside the (turned/tilted) view?
+    if(ra<0||rb<0||ra>=fw||rb>=fh||!grv[rb*fw+ra])continue;
     n++;const k=ck(i,j);all.push(k);
     const e=cm.get(k);
     if(e===undefined){nNew++;allow.push([i,j]);}
@@ -243,9 +332,10 @@ function paintLo(px,py,sc,aset){
       const b=((v+0.5-py)*inv+ay)|0;if(b<0||b>=fh)continue;
       for(let u=xs;u<xe;u++){
         const a=((u+0.5-px)*inv+ax)|0;if(a<0||a>=fw)continue;
+        if(!grv[b*fw+a])continue;                 // outside the live view once tilt/turn is undone
         const idx=(v-tj*T)*T+(u-ti*T);
         if(aset&&t.v[idx]&&!aset.has(ck(Math.floor(u/cs),Math.floor(v/cs))))continue;
-        t.g[idx]=g[b*fw+a];t.v[idx]=1;
+        t.g[idx]=gr[b*fw+a];t.v[idx]=1;
       }
     }
   }
@@ -272,6 +362,7 @@ function score(ccx,ccy,sc,step,minFrac){
   let n=0,sa=0,sb=0,saa=0,sbb=0,sab=0,tot=0;
   for(let i=0;i<N;i+=step){
     tot++;
+    if(!tv[i])continue;
     const u=ccx+tox[i]*sc-rx0+0.5,v=ccy+toy[i]*sc-ry0+0.5;
     if(u<0||v<0)continue;
     const xi=u|0,yi=v|0;if(xi>=gw||yi>=gh)continue;
@@ -286,9 +377,20 @@ function score(ccx,ccy,sc,step,minFrac){
 }
 const parab=(c,l,r)=>{const d=l-2*c+r;return Math.abs(d)<1e-9?0:Math.max(-0.5,Math.min(0.5,0.5*(l-r)/d));};
 
+// template = the middle of the rectified frame, optionally turned by d radians about the view centre
+function fillTemplate(d){
+  if(d===0){for(let i=0;i<N;i++){const j=gidx[i];ta[i]=gr[j];tv[i]=grv[j];}return;}
+  const c=Math.cos(d),s=Math.sin(d),c0x=fw>>1,c0y=fh>>1;
+  for(let i=0;i<N;i++){
+    const x=Math.round(c0x+tox[i]*c-toy[i]*s),y=Math.round(c0y+tox[i]*s+toy[i]*c);
+    if(x<0||y<0||x>=fw||y>=fh){tv[i]=0;continue;}
+    const j=y*fw+x;ta[i]=gr[j];tv[i]=grv[j];
+  }
+}
+const ROT_STEPS=[-4,-1.8,-0.8,-0.3,0.3,0.8,1.8,4].map(d=>d*Math.PI/180);
 function doTrack(px,py,sc,R,wasLost){
   if(!fetchRegion(px,py,R,sc))return null;
-  for(let i=0;i<N;i++)ta[i]=g[gidx[i]];
+  fillTemplate(0);
   const sC=R>60?3:2,x0=Math.round(px),y0=Math.round(py);
   let best=-2,bx=x0,by=y0;
   for(let dy=-R;dy<=R;dy+=sC)for(let dx=-R;dx<=R;dx+=sC){
@@ -318,7 +420,25 @@ function doTrack(px,py,sc,R,wasLost){
     for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const s=score(rx+dx,ry+dy,outSc,1,0.25);if(s>b2){b2=s;ax=rx+dx;ay=ry+dy;}}
     if(b2>0){fx=ax;fy=ay;fs=b2;}
   }
-  return {x:fx,y:fy,sc:outSc,score:fs};
+  // leftover turn about the optical axis (the motion sensors drift a little): try small turns of the template
+  let dpsi=0;
+  if(fs>0.2){
+    const sAt=d=>{fillTemplate(d);return score(fx,fy,outSc,1,0.25);};
+    let bs=fs,bd=0;
+    for(const dd of ROT_STEPS){const s=sAt(dd);if(s>bs){bs=s;bd=dd;}}
+    const h=0.0026,sl=sAt(bd-h),sr=sAt(bd+h),den=sl-2*bs+sr;      // smooth (sub-step) estimate from the three scores around the best turn
+    dpsi=(sl>=0&&sr>=0&&den<-1e-7)?bd+h*Math.max(-1,Math.min(1,0.5*(sl-sr)/den)):bd;
+    fillTemplate(dpsi);                                              // re-fit the position with the turned template
+    let b3=-2,qx=Math.round(fx),qy=Math.round(fy);
+    for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const s=score(Math.round(fx)+dx,Math.round(fy)+dy,outSc,1,0.25);if(s>b3){b3=s;qx=Math.round(fx)+dx;qy=Math.round(fy)+dy;}}
+    if(b3>0){
+      fx=qx;fy=qy;fs=b3;
+      const l=score(qx-1,qy,outSc,1,0.3),r=score(qx+1,qy,outSc,1,0.3),u=score(qx,qy-1,outSc,1,0.3),d=score(qx,qy+1,outSc,1,0.3);
+      if(l>=0&&r>=0)fx+=parab(b3,l,r);if(u>=0&&d>=0)fy+=parab(b3,u,d);
+    }
+    fillTemplate(0);
+  }
+  return {x:fx,y:fy,sc:outSc,score:fs,dpsi};
 }
 
 /* ---------- Start points (4 anchors with permanent reference patches) ---------- */
@@ -328,12 +448,13 @@ const ptx=new Int8Array(PN),pty=new Int8Array(PN);
 
 // place a corner exactly at the centre of the current view (where the on-screen target is); returns patch variance
 function addCorner(){
+  const [pa,pb]=liveCenterRef();         // the target is the real optical axis, which moves off the frame centre when tilted
   const pv=new Uint8Array(PN);let s=0,s2=0;
   for(let i=0;i<PN;i++){                 // patch is sampled in global units, so it stays valid at any height
-    const x=Math.max(0,Math.min(fw-1,Math.round(fw/2+ptx[i]/smSc))),y=Math.max(0,Math.min(fh-1,Math.round(fh/2+pty[i]/smSc)));
-    const v=g[y*fw+x];pv[i]=v;s+=v;s2+=v*v;
+    const x=Math.max(0,Math.min(fw-1,Math.round(pa+ptx[i]/smSc))),y=Math.max(0,Math.min(fh-1,Math.round(pb+pty[i]/smSc)));
+    const v=gr[y*fw+x];pv[i]=v;s+=v;s2+=v*v;
   }
-  anchors.push({name:CORNER_NAMES[anchors.length],gx:cx,gy:cy,pv});
+  anchors.push({name:CORNER_NAMES[anchors.length],gx:cx+(pa-fw/2)*smSc,gy:cy+(pb-fh/2)*smSc,pv});
   return s2/PN-(s/PN)*(s/PN);
 }
 function cornerHint(){
@@ -349,13 +470,14 @@ function addKey(){
   for(let dy=-24;dy<=24;dy+=12)for(let dx=-40;dx<=40;dx+=20){
     const lx=fw/2+dx,ly=fh/2+dy;
     if(lx<ext||lx>fw-1-ext||ly<ext||ly>fh-1-ext)continue;
+    if(!grv[Math.round(ly-ext)*fw+Math.round(lx-ext)]||!grv[Math.round(ly-ext)*fw+Math.round(lx+ext)]||!grv[Math.round(ly+ext)*fw+Math.round(lx-ext)]||!grv[Math.round(ly+ext)*fw+Math.round(lx+ext)])continue;
     let s=0,s2=0;
-    for(let i=0;i<PN;i++){const v=g[Math.round(ly+pty[i]/smSc)*fw+Math.round(lx+ptx[i]/smSc)];s+=v;s2+=v*v;}
+    for(let i=0;i<PN;i++){const v=gr[Math.round(ly+pty[i]/smSc)*fw+Math.round(lx+ptx[i]/smSc)];s+=v;s2+=v*v;}
     const va=s2/PN-(s/PN)*(s/PN);if(va>best){best=va;bdx=dx;bdy=dy;}
   }
   if(best<16)return;                       // too flat to be a useful reference
   const lx=fw/2+bdx,ly=fh/2+bdy,pv=new Uint8Array(PN);
-  for(let i=0;i<PN;i++)pv[i]=g[Math.round(ly+pty[i]/smSc)*fw+Math.round(lx+ptx[i]/smSc)];
+  for(let i=0;i<PN;i++)pv[i]=gr[Math.round(ly+pty[i]/smSc)*fw+Math.round(lx+ptx[i]/smSc)];
   keys.push({gx:cx+bdx*smSc,gy:cy+bdy*smSc,pv});
 }
 // the start points plus the few invisible points closest to the middle of the view
@@ -386,7 +508,8 @@ function matchAnchor(a,lx0,ly0,Rx,Ry,step,scs,pstep){
         const u=lx+ptx[i]*inv+0.5,v=ly+pty[i]*inv+0.5;
         if(u<0||v<0)continue;
         const xi=u|0,yi=v|0;if(xi>=fw||yi>=fh)continue;
-        const b=g[yi*fw+xi],a2=a.pv[i];
+        if(!grv[yi*fw+xi])continue;
+        const b=gr[yi*fw+xi],a2=a.pv[i];
         n++;sa+=a2;sb+=b;saa+=a2*a2;sbb+=b*b;sab+=a2*b;
       }
       if(n<tot*0.75||n<30)continue;
@@ -441,6 +564,7 @@ function anchorCorrect(){
 function loop(t){
   requestAnimationFrame(loop);
   if(origin&&phase!=='done'&&g){          // ease the drawn pose toward the latest tracked pose every frame
+    Mn=withPsi(rawM());                   // turn/tilt comes straight from the sensors, so markers stay glued to the surface
     if(!dInit||Math.hypot(cx-dcx,cy-dcy)>60*smSc||lost){dcx=cx;dcy=cy;dsc=smSc;dInit=true;}
     else{dcx+=(cx-dcx)*0.4;dcy+=(cy-dcy)*0.4;dsc+=(smSc-dsc)*0.25;}
     drawOverlay();
@@ -479,6 +603,8 @@ function process(dt){
   const m={mean,diff,fr,tex:e2};
   lastM=m;
   tickN++;
+  if(origin){Mraw=rawM();Mt=withPsi(Mraw);rectify();}
+  else{Mraw=ID3;Mt=ID3;gr.set(g);grv.fill(1);}
   if(snapReq&&performance.now()>snapReq){endSnap();say(lost?'Snap failed: tracking lost':'Snap timed out: hold still so it can focus, then try again',3500);}
   if(!origin){armStep(m);drawOverlay();}
   else{trackStep(m,dt);drawOverlay();}
@@ -505,6 +631,8 @@ function placeFirstCorner(){
   const q=quality(m);
   if(q[0]==='red'){say(q[1]+': '+q[2]);return;}
   tiles=new Map();shots=[];cb=null;cov=new Map();mcov=new Map();anchors=[];keys=[];
+  Rref=gyroOK?levelRef(camR()):null;psi=0;prevRaw=null;dInit=false;     // this orientation defines "flat" for the whole scan
+  Mraw=rawM();Mt=Mraw;Mn=Mt;rectify();                                  // the first picture is flattened too
   Hcm=parseFloat($('hcm').value)||Hcm;
   cx=fw/2;cy=fh/2;vx=vy=0;smSc=1;lost=false;failN=0;speed=0;stableN=0;lastScore=1;
   const c=cellsFor(cx,cy,1,1,mcov);
@@ -529,24 +657,26 @@ function takeShot(c,Q){
   shotCx.drawImage(video,0,0,vw,vh);
   const th=document.createElement('canvas');th.width=96;th.height=Math.max(2,Math.round(96*fh/fw));
   th.getContext('2d').drawImage(cap,0,0,th.width,th.height);
-  const s={x:cx,y:cy,sc:smSc,allow,th,blob:null};
+  const s={x:cx,y:cy,sc:smSc,allow,th,blob:null,M:Mt.slice(),q:quadOf(Mt,cx,cy,smSc)};   // the full 3D pose is kept so the final stitch can flatten this picture
   shots.push(s);
   shotCv.toBlob(b=>{s.blob=b;},'image/jpeg',0.88);
-  const hw=fw*smSc*(0.5-INSET),hh=fh*smSc*(0.5-INSET);
-  if(!cb)cb={x0:cx-hw,y0:cy-hh,x1:cx+hw,y1:cy+hh};
-  else{cb.x0=Math.min(cb.x0,cx-hw);cb.y0=Math.min(cb.y0,cy-hh);cb.x1=Math.max(cb.x1,cx+hw);cb.y1=Math.max(cb.y1,cy+hh);}
+  const qx=s.q.map(p=>p[0]),qy=s.q.map(p=>p[1]),bx0=Math.min(...qx),by0=Math.min(...qy),bx1=Math.max(...qx),by1=Math.max(...qy);
+  if(!cb)cb={x0:bx0,y0:by0,x1:bx1,y1:by1};
+  else{cb.x0=Math.min(cb.x0,bx0);cb.y0=Math.min(cb.y0,by0);cb.x1=Math.max(cb.x1,bx1);cb.y1=Math.max(cb.y1,by1);}
   markCells(c.all,Q);placed=shots.length;addKey();updateInfo();
 }
 
 function homeHint(){
   const tl=anchors[0];if(!tl)return 'Move back over the area you already scanned';
-  const dx=tl.gx-cx,dy=tl.gy-cy,arrows=['→','↘','↓','↙','←','↖','↑','↗'];
+  let dx=tl.gx-cx,dy=tl.gy-cy;const arrows=['→','↘','↓','↙','←','↖','↑','↗'];
+  const lp=mapToLive(Mt,tl.gx,tl.gy,cx,cy,smSc);if(lp){dx=lp[0]-fw/2;dy=lp[1]-fh/2;}      // direction as seen on screen, not on the map
   const idx=((Math.round(Math.atan2(dy,dx)/(Math.PI/4))%8)+8)%8;
-  const d=Math.hypot(dx,dy)/(fw*smSc);
+  const d=Math.hypot(tl.gx-cx,tl.gy-cy)/(fw*smSc);
   return 'Return to the top-left START point '+arrows[idx]+(d>0.6?' (about '+d.toFixed(1)+' screens away)':'');
 }
 
 function trackStep(m,dt){
+  const rotStep=prevRaw?angBetween(prevRaw,Mraw):0;prevRaw=Mraw;     // how far the phone turned since the last tick (radians)
   const R0=lost?100:Math.max(26,Math.round(20+Math.hypot(vx,vy)*1.6));
   const R=Math.min(150,Math.round(R0*Math.max(1,dt/CFG.TICK_MS)));   // widen the search if the phone stalled for a moment
   let r=doTrack(cx+(lost?0:vx),cy+(lost?0:vy),smSc,R,lost);
@@ -570,10 +700,17 @@ function trackStep(m,dt){
   else smSc=0.35*smSc+0.65*r.sc;
   smSc=Math.max(CFG.MIN_SC,Math.min(CFG.MAX_SC,smSc));
   lastScore=r.score;
+  if(r.dpsi){                               // leftover turn: this frame uses all of it; the slow sensor drift (psi) learns a little of it each tick
+    psi+=0.15*r.dpsi;
+    Mt=mmul(Mt,Rzm(r.dpsi));rectify();
+  }
   if(wasLost||Math.abs(smSc/oldSc-1)>0.05)stableN=0;else stableN++;
   if(tickN%4===0)anchorCorrect();
-  const tooFast=speed/smSc>CFG.SPEED*fw;
+  const tooFast=speed/smSc>CFG.SPEED*fw||rotStep>0.05;      // sliding fast or turning fast (more than ~3° per tick) blurs the picture
   const scaleOut=smSc<0.5||smSc>1.9;
+  const tiltOut=Mt[8]<Math.cos(CFG.MAX_TILT*Math.PI/180);
+  const qf=Math.max(0.3,Mt[8]);             // pictures taken square-on beat tilted ones when they cover the same spot
+  const tiltDeg=Math.round(Math.acos(Math.min(1,Mt[8]))*180/Math.PI),turnDeg=Math.round(Math.atan2(Mt[3]-Mt[1],Mt[0]+Mt[4])*180/Math.PI);
   let col,a;
   if(phase==='setup'){                      // never red while placing corners: tracking is what matters here
     if(m.fr<CFG.FOCUS_WARN){col='yellow';a='Hold still to focus';}
@@ -584,9 +721,11 @@ function trackStep(m,dt){
   else if(m.fr<CFG.FOCUS_WARN){col='red';a='Out of focus';}
   else if(tooFast){col='yellow';a='Slow down';}
   else if(scaleOut){col='yellow';a=smSc<0.5?'Too close to start height':'Too far from start height';}
+  else if(tiltOut){col='yellow';a='Hold the phone flatter';}
   else if(m.fr<CFG.FOCUS_OK){col='yellow';a='Refocusing…';}
   else{col='green';a=phase==='setup'?'Tracking':snapReq?'Snapping…':'Capturing';}
-  setRing(col,Math.round(smSc*100)+'%',a,phase==='setup'?cornerHint():'Height ≈ '+(Hcm*smSc).toFixed(0)+' cm · '+placed+' shots');
+  const pose=' · '+(gyroOK?'tilt '+tiltDeg+'° · ':'')+'turn '+turnDeg+'°';
+  setRing(col,Math.round(smSc*100)+'%',a,phase==='setup'?cornerHint()+pose:'Height ≈ '+(Hcm*smSc).toFixed(0)+' cm'+pose+' · '+placed+' shots');
   if(phase==='setup'){                      // map-only painting so tracking survives the walk between corners
     if(speed/smSc<=CFG.SPEED*fw*2&&m.fr>=CFG.FOCUS_WARN&&stableN>=1&&lastScore>=0.5){   // paint often and loosely so the map keeps up with you
       const c=cellsFor(cx,cy,smSc,1,mcov);
@@ -598,11 +737,11 @@ function trackStep(m,dt){
     return;
   }
   if(phase==='scanning'&&snapReq&&speed/smSc<=CFG.SPEED*fw*1.8&&m.fr>=CFG.FOCUS_WARN&&stableN>=1&&lastScore>=0.5){
-    const Q=m.fr/smSc,c=cellsFor(cx,cy,smSc,Q,cov,true);   // forced shot: overlays everything it covers
+    const Q=m.fr/smSc*qf,c=cellsFor(cx,cy,smSc,Q,cov,true);   // forced shot: overlays everything it covers
     takeShot(c,Q);flash();endSnap();say('Snapped',1500);
   }
-  else if(phase==='scanning'&&!tooFast&&!scaleOut&&m.fr>=CFG.FOCUS_OK&&stableN>=3&&lastScore>=0.55){
-    const Q=m.fr/smSc;                       // sharper and closer is better
+  else if(phase==='scanning'&&!tooFast&&!scaleOut&&!tiltOut&&m.fr>=CFG.FOCUS_OK&&stableN>=3&&lastScore>=0.55){
+    const Q=m.fr/smSc*qf;                    // sharper, closer and squarer-on is better
     const c=cellsFor(cx,cy,smSc,Q);
     if(c.n>0&&(c.nNew+0.6*c.nBet)/c.n>=CFG.GAIN){takeShot(c,Q);flash();}
   }
@@ -625,7 +764,8 @@ function drawOverlay(){
   if(!anchors.length||phase==='idle')return;
   const scr=Math.max(W/vw,H/vh),ox=(W-vw*scr)/2,oy=(H-vh*scr)/2,k=vw/fw*scr;
   if(lost){
-    const tl=anchors[0],dx=tl.gx-cx,dy=tl.gy-cy,L=Math.hypot(dx,dy)||1,ux=dx/L,uy=dy/L;
+    const tl=anchors[0],lp=mapToLive(Mn,tl.gx,tl.gy,dcx,dcy,dsc);   // arrow points to START as seen on screen
+    const dx=lp?lp[0]-fw/2:tl.gx-cx,dy=lp?lp[1]-fh/2:tl.gy-cy,L=Math.hypot(dx,dy)||1,ux=dx/L,uy=dy/L;
     const x0=W/2,y0=H/2,x1=x0+ux*Math.min(120,W*0.3),y1=y0+uy*Math.min(120,W*0.3);
     ovx.strokeStyle='#ff3b30';ovx.fillStyle='#ff3b30';ovx.lineWidth=6;ovx.lineCap='round';
     ovx.beginPath();ovx.moveTo(x0,y0);ovx.lineTo(x1,y1);ovx.stroke();
@@ -634,14 +774,15 @@ function drawOverlay(){
     ovx.font='bold 15px -apple-system,sans-serif';ovx.textAlign='center';ovx.fillText('START',x1+ux*30,y1+uy*30);
     return;
   }
-  const pts=anchors.map(a=>[(fw/2+(a.gx-dcx)/dsc)*k+ox,(fh/2+(a.gy-dcy)/dsc)*k+oy]);
-  if(pts.length>1){                         // outline of the area
+  const pts=anchors.map(a=>{const p=mapToLive(Mn,a.gx,a.gy,dcx,dcy,dsc);return p?[p[0]*k+ox,p[1]*k+oy]:null;});
+  if(pts.length>1&&pts.every(p=>p)){        // outline of the area
     ovx.strokeStyle='rgba(255,255,255,.6)';ovx.lineWidth=2;ovx.setLineDash([8,6]);
     ovx.beginPath();pts.forEach((p,i)=>i?ovx.lineTo(p[0],p[1]):ovx.moveTo(p[0],p[1]));
     if(pts.length===4)ovx.closePath();
     ovx.stroke();ovx.setLineDash([]);
   }
   anchors.forEach((a,i)=>{
+    if(!pts[i])return;
     const X=pts[i][0],Y=pts[i][1];
     if(X<-30||Y<-30||X>W+30||Y>H+30)return;
     const home=i===0,r=home?20:13;
@@ -658,15 +799,18 @@ function drawMM(){
   const w=mm.width,h=mm.height;
   mmx.fillStyle='#1c1c1e';mmx.fillRect(0,0,w,h);
   if(!origin)return;
-  const fhw=fw*smSc/2,fhh=fh*smSc/2;
-  let x0=cx-fhw,y0=cy-fhh,x1=cx+fhw,y1=cy+fhh;
+  const cq=quadOf(Mt,cx,cy,smSc);           // the current view's footprint, turned/tilted like the real picture
+  let x0=Math.min(...cq.map(p=>p[0])),y0=Math.min(...cq.map(p=>p[1])),x1=Math.max(...cq.map(p=>p[0])),y1=Math.max(...cq.map(p=>p[1]));
   if(cb){x0=Math.min(x0,cb.x0);y0=Math.min(y0,cb.y0);x1=Math.max(x1,cb.x1);y1=Math.max(y1,cb.y1);}
   for(const a of anchors){x0=Math.min(x0,a.gx-8);y0=Math.min(y0,a.gy-8);x1=Math.max(x1,a.gx+8);y1=Math.max(y1,a.gy+8);}
   const s=Math.min((w-6)/(x1-x0),(h-6)/(y1-y0));
   const tx=(x)=>3+(x-x0)*s,ty=(y)=>3+(y-y0)*s;
   for(const sh of shots){
-    const hw=fw*sh.sc*(0.5-INSET),hh=fh*sh.sc*(0.5-INSET),t=sh.th;
-    mmx.drawImage(t,t.width*INSET,t.height*INSET,t.width*(1-2*INSET),t.height*(1-2*INSET),tx(sh.x-hw),ty(sh.y-hh),2*hw*s,2*hh*s);
+    const q=sh.q,t=sh.th,TL=q[0],TR=q[1],BL=q[3];
+    mmx.save();                              // draw the thumbnail onto its turned footprint
+    mmx.transform(s*(TR[0]-TL[0]),s*(TR[1]-TL[1]),s*(BL[0]-TL[0]),s*(BL[1]-TL[1]),tx(TL[0]),ty(TL[1]));
+    mmx.drawImage(t,t.width*INSET,t.height*INSET,t.width*(1-2*INSET),t.height*(1-2*INSET),0,0,1,1);
+    mmx.restore();
   }
   if(anchors.length>1){
     mmx.strokeStyle='rgba(255,255,255,.7)';mmx.lineWidth=1;mmx.setLineDash([4,3]);
@@ -676,7 +820,7 @@ function drawMM(){
   }
   anchors.forEach((a,i)=>{mmx.fillStyle=i===0?'#34c759':'#fff';mmx.beginPath();mmx.arc(tx(a.gx),ty(a.gy),i===0?5:3,0,Math.PI*2);mmx.fill();});
   mmx.strokeStyle=lost?'#ff3b30':'#34c759';mmx.lineWidth=2;
-  mmx.strokeRect(tx(cx-fhw),ty(cy-fhh),2*fhw*s,2*fhh*s);
+  mmx.beginPath();cq.forEach((p,i)=>i?mmx.lineTo(tx(p[0]),ty(p[1])):mmx.moveTo(tx(p[0]),ty(p[1])));mmx.closePath();mmx.stroke();
 }
 function updateInfo(){
   if(cb)$('mmInfo').textContent=shots.length+' shots · '+Math.round((cb.x1-cb.x0)*P0)+'×'+Math.round((cb.y1-cb.y0)*P0);
@@ -724,13 +868,14 @@ bReset.onclick=()=>{if(!shots.length||confirm('Discard this scan and start over?
 function resetAll(){
   tiles=new Map();shots=[];anchors=[];keys=[];cb=null;cov=new Map();mcov=new Map();rawOut=null;placed=0;stableN=0;failN=0;
   origin=false;endSnap();
+  Rref=null;psi=0;Mt=ID3;Mn=ID3;Mraw=ID3;prevRaw=null;dInit=false;
   phase='idle';lost=false;armGood=0;armTicks=0;focusRef=1e-6;smSc=1;
   show('scan');setUI();drawMM();drawOverlay();
 }
 bFinish.onclick=()=>{
   if(!shots.length||!cb)return;
   if(phase==='scanning'&&!lost&&stableN>=2&&lastFr>=CFG.FOCUS_WARN){   // final shot so the last stretch isn't left out
-    const Q=lastFr/smSc,c=cellsFor(cx,cy,smSc,Q);
+    const Q=lastFr/smSc*Math.max(0.3,Mt[8]),c=cellsFor(cx,cy,smSc,Q);
     if(c.n>0&&c.nNew>0)takeShot(c,Q);
   }
   phase='done';show('result');compose();
@@ -742,25 +887,52 @@ async function decode(b){
   if(typeof createImageBitmap==='function'){try{return await createImageBitmap(b);}catch(e){}}
   return await new Promise((res,rej)=>{const im=new Image(),u=URL.createObjectURL(b);im.onload=()=>{URL.revokeObjectURL(u);res(im);};im.onerror=rej;im.src=u;});
 }
+// draw one source triangle onto one destination triangle (affine), slightly grown so neighbouring triangles leave no seam
+function triDraw(c,img,s0,s1,s2,d0,d1,d2){
+  const det=(s1[0]-s0[0])*(s2[1]-s0[1])-(s2[0]-s0[0])*(s1[1]-s0[1]);
+  if(Math.abs(det)<1e-9)return;
+  const a=((d1[0]-d0[0])*(s2[1]-s0[1])-(d2[0]-d0[0])*(s1[1]-s0[1]))/det,cc=((s1[0]-s0[0])*(d2[0]-d0[0])-(s2[0]-s0[0])*(d1[0]-d0[0]))/det;
+  const b=((d1[1]-d0[1])*(s2[1]-s0[1])-(d2[1]-d0[1])*(s1[1]-s0[1]))/det,d=((s1[0]-s0[0])*(d2[1]-d0[1])-(s2[0]-s0[0])*(d1[1]-d0[1]))/det;
+  const e=d0[0]-a*s0[0]-cc*s0[1],f=d0[1]-b*s0[0]-d*s0[1];
+  const gx=(d0[0]+d1[0]+d2[0])/3,gy=(d0[1]+d1[1]+d2[1])/3;
+  c.save();c.beginPath();
+  [d0,d1,d2].forEach((p,i)=>{const vx2=p[0]-gx,vy2=p[1]-gy,L=Math.hypot(vx2,vy2)||1,X=p[0]+vx2/L*0.6,Y=p[1]+vy2/L*0.6;i?c.lineTo(X,Y):c.moveTo(X,Y);});
+  c.closePath();c.clip();c.transform(a,b,cc,d,e,f);c.drawImage(img,0,0);c.restore();
+}
+const rcv=document.createElement('canvas'),rcx=rcv.getContext('2d'),rmv=document.createElement('canvas'),rmx=rmv.getContext('2d');
+// put one picture on the map: its full 3D pose flattens it (a mesh of small triangles approximates the perspective warp)
 function blitHi(ctx,scale,ox,oy,src,SW,SH,s){
-  const sx=SW*INSET,sy=SH*INSET,sw=SW*(1-2*INSET),sh=SH*(1-2*INSET);
-  const ux=s.x-fw*s.sc*(0.5-INSET),uy=s.y-fh*s.sc*(0.5-INSET),uw=fw*s.sc*(1-2*INSET),uh=fh*s.sc*(1-2*INSET);
-  const dx=(ux-ox)*scale,dy=(uy-oy)*scale,dw=uw*scale,dh=uh*scale;
-  ctx.globalCompositeOperation='destination-over';   // fill only empty areas with the whole tile
-  ctx.drawImage(src,sx,sy,sw,sh,dx,dy,dw,dh);
+  const m=s.M||ID3,GX=6,GY=4,kx=SW/fw,ky=SH/fh,mw=mask.width,mh=mask.height,V=[];
+  let bx0=1e18,by0=1e18,bx1=-1e18,by1=-1e18;
+  for(let iy=0;iy<=GY;iy++)for(let ix=0;ix<=GX;ix++){
+    const a=fw*(INSET+(1-2*INSET)*ix/GX),b=fh*(INSET+(1-2*INSET)*iy/GY),rx=(a-fw/2)/FL,ry=(b-fh/2)/FL;
+    const Z=Math.max(0.05,m[2]*rx+m[5]*ry+m[8]),iz=FL/Z;
+    const dx=(s.x+(m[0]*rx+m[3]*ry+m[6])*iz*s.sc-ox)*scale,dy=(s.y+(m[1]*rx+m[4]*ry+m[7])*iz*s.sc-oy)*scale;
+    V.push({d:[dx,dy],s:[a*kx,b*ky],m:[ix/GX*mw,iy/GY*mh]});
+    bx0=Math.min(bx0,dx);by0=Math.min(by0,dy);bx1=Math.max(bx1,dx);by1=Math.max(by1,dy);
+  }
+  const bx=Math.floor(bx0)-2,by=Math.floor(by0)-2,bw=Math.ceil(bx1)-bx+3,bh=Math.ceil(by1)-by+3;
+  for(const v of V)v.d=[v.d[0]-bx,v.d[1]-by];
+  rcv.width=bw;rcv.height=bh;rmv.width=bw;rmv.height=bh;
+  for(let iy=0;iy<GY;iy++)for(let ix=0;ix<GX;ix++){
+    const v00=V[iy*(GX+1)+ix],v10=V[iy*(GX+1)+ix+1],v01=V[(iy+1)*(GX+1)+ix],v11=V[(iy+1)*(GX+1)+ix+1];
+    triDraw(rcx,src,v00.s,v10.s,v11.s,v00.d,v10.d,v11.d);triDraw(rcx,src,v00.s,v11.s,v01.s,v00.d,v11.d,v01.d);
+    triDraw(rmx,mask,v00.m,v10.m,v11.m,v00.d,v10.d,v11.d);triDraw(rmx,mask,v00.m,v11.m,v01.m,v00.d,v11.d,v01.d);
+  }
+  ctx.globalCompositeOperation='destination-over';   // fill only empty areas with the whole picture
+  ctx.drawImage(rcv,bx,by);
   ctx.globalCompositeOperation='source-over';
   if(s.allow&&!s.allow.length)return;
-  const tw=Math.max(2,Math.ceil(dw)),th=Math.max(2,Math.ceil(dh));
-  tmpH.width=tw;tmpH.height=th;                       // feathered copy blends over what is already there
-  tmpHx.drawImage(src,sx,sy,sw,sh,0,0,tw,th);
+  tmpH.width=bw;tmpH.height=bh;                       // feathered copy blends over what is already there
+  tmpHx.drawImage(rcv,0,0);
   tmpHx.globalCompositeOperation='destination-in';
-  tmpHx.drawImage(mask,0,0,tw,th);
+  tmpHx.drawImage(rmv,0,0);
   tmpHx.globalCompositeOperation='source-over';
   if(s.allow){
     ctx.save();ctx.beginPath();
     for(const c of s.allow)ctx.rect((c[0]*cs-ox)*scale,(c[1]*cs-oy)*scale,cs*scale,cs*scale);
-    ctx.clip();ctx.drawImage(tmpH,dx,dy,dw,dh);ctx.restore();
-  }else ctx.drawImage(tmpH,dx,dy,dw,dh);
+    ctx.clip();ctx.drawImage(tmpH,bx,by);ctx.restore();
+  }else ctx.drawImage(tmpH,bx,by);
 }
 async function compose(){
   const id=++composeId;
