@@ -36,10 +36,14 @@ button[hidden]{display:none}
 #l2{font-size:14px;color:#e8e8ea;text-shadow:0 1px 4px #000;margin-top:2px}
 #mmwrap{position:absolute;right:12px;top:calc(max(12px,env(safe-area-inset-top)) + 92px);background:#000a;border-radius:10px;padding:4px;font-size:11px;color:#ccc;text-align:center}
 #mm{width:110px;height:110px;display:block;border-radius:6px}
-.bar{position:absolute;left:0;right:0;bottom:0;padding:14px 14px max(18px,env(safe-area-inset-bottom));display:flex;gap:10px;background:linear-gradient(#0000,#000d)}
+.bar{position:absolute;left:0;right:0;bottom:0;padding:14px 14px max(18px,env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:8px;background:linear-gradient(#0000,#000d)}
+.bar .row{display:flex;gap:10px}
+.bar .row[hidden]{display:none}
 .bar button{flex:1}
-.bar button#bReset{flex:0 0 auto}
-#toast{position:absolute;left:14px;right:14px;bottom:calc(96px + env(safe-area-inset-bottom));background:#000c;border-radius:12px;padding:10px 12px;font-size:14px;display:none}
+.bar button#bReset,.bar button#bUndo,.bar button#bSnap{flex:0 0 auto}
+.bar button#bSnap{background:#5e5ce6}
+.bar button:disabled{opacity:.55}
+#toast{position:absolute;left:14px;right:14px;bottom:calc(150px + env(safe-area-inset-bottom));background:#000c;border-radius:12px;padding:10px 12px;font-size:14px;display:none}
 #result{background:#0c0d10}
 #result .imgbox{position:absolute;left:0;top:0;right:0;bottom:170px;display:flex;align-items:center;justify-content:center;padding:10px;overflow:auto}
 #result img{max-width:100%;max-height:100%;object-fit:contain;border-radius:6px;background:#fff}
@@ -53,11 +57,12 @@ button[hidden]{display:none}
 
 <div id="intro" class="screen on">
   <h1>Wand Scan</h1>
-  <p>Scan documents, posters or any flat surface with your iPhone camera. Tap Start, then slowly move the phone over the surface. The app decides on its own when to take each shot (sharp, steady, and covering new area) and stitches them into one image.</p>
+  <p>Scan documents, posters or any flat surface with your iPhone camera. First mark the four corners of the area by hand, then tap Start scan and slowly move the phone over the surface. The app decides on its own when to take each shot (sharp, steady, and covering new area) and stitches them into one image. Tap <b>Snap now</b> any time to force a shot within a few seconds.</p>
   <label>Phone height above the surface (cm, rough guess)
     <input id="hcm" type="number" value="20" min="8" max="80" inputmode="decimal"></label>
   <ul>
-    <li>Start with the <b>top-left corner</b> of the area you want to scan in view, at a comfortable height of about <b>15–25 cm</b>. The first shot sets four <b>start points</b> on the surface. The top-left one is your <b>home</b>: if tracking is ever lost, return to it and the scan carries on.</li>
+    <li><b>Set the four corners first.</b> Hold the phone at a comfortable height of about <b>15–25 cm</b> and put the on-screen target over the <b>top-left corner</b> of your area, then tap <b>Place corner 1</b>. Move the phone (slowly, same height) to the top-right, bottom-right and bottom-left corners and tap the button at each. Use <b>Undo corner</b> if you misplace one. Then tap <b>Start scan</b>.</li>
+    <li>The top-left corner is your <b>home</b>: if tracking is ever lost, return to it and the scan carries on.</li>
     <li>Sweep slowly, like painting. For big things do rows or columns in a snake pattern and overlap each pass by about 30–50%. There's no size limit while scanning.</li>
     <li><b>Go closer for detail.</b> Closer shots are higher resolution and replace blurrier or farther ones, as long as the camera can still focus (about 12 cm minimum).</li>
     <li>Keep the phone roughly <b>parallel</b> to the surface.</li>
@@ -79,10 +84,16 @@ button[hidden]{display:none}
   <div id="mmwrap"><canvas id="mm" width="220" height="220"></canvas><div id="mmInfo">map</div></div>
   <div id="toast"></div>
   <div class="bar">
-    <button id="bMain" class="go">Start scan</button>
-    <button id="bFinish" hidden>Finish</button>
-    <button id="bTorch" hidden>Torch</button>
-    <button id="bReset" class="warn" hidden>↺</button>
+    <div class="row">
+      <button id="bMain" class="go">Place corner 1</button>
+      <button id="bSnap" hidden>Snap now</button>
+    </div>
+    <div class="row" id="row2" hidden>
+      <button id="bFinish" hidden>Finish</button>
+      <button id="bUndo" hidden>Undo corner</button>
+      <button id="bTorch" hidden>Torch</button>
+      <button id="bReset" class="warn" hidden>↺</button>
+    </div>
   </div>
 </div>
 
@@ -124,9 +135,11 @@ const CFG={
 
 const $=id=>document.getElementById(id);
 const video=$('v'),ring=$('ring'),ringT=$('ringT'),l1=$('l1'),l2=$('l2'),mm=$('mm'),mmx=mm.getContext('2d'),toast=$('toast'),ov=$('ov'),ovx=ov.getContext('2d');
-const bMain=$('bMain'),bFinish=$('bFinish'),bTorch=$('bTorch'),bReset=$('bReset');
+const bMain=$('bMain'),bFinish=$('bFinish'),bTorch=$('bTorch'),bReset=$('bReset'),bSnap=$('bSnap'),bUndo=$('bUndo'),row2=$('row2');
+const CORNER_NAMES=['TL','TR','BR','BL'],CORNER_DESC=['top-left','top-right','bottom-right','bottom-left'];
 
-let stream=null,vtrack=null,phase='idle',wake=null;   // idle | scanning | paused | done
+let stream=null,vtrack=null,phase='idle',wake=null;   // idle | setup (placing corners) | scanning | paused | done
+let origin=false,mcov=new Map(),lastM=null,snapReq=0;
 let vw=0,vh=0,fw=0,fh=0,P0=1,HX=0,HY=0,N=0,FC=256;
 const cap=document.createElement('canvas'),capx=cap.getContext('2d',{willReadFrequently:true});
 const fcv=document.createElement('canvas'),fcx=fcv.getContext('2d',{willReadFrequently:true});
@@ -163,7 +176,7 @@ $('open').onclick=async()=>{
     if(caps.focusMode&&caps.focusMode.includes('continuous'))vtrack.applyConstraints({advanced:[{focusMode:'continuous'}]}).catch(()=>{});
   }catch(e){}
   try{if(navigator.wakeLock)wake=await navigator.wakeLock.request('screen');}catch(e){}
-  const init=()=>{if(video.videoWidth&&!shots.length)initGeometry();};
+  const init=()=>{if(video.videoWidth&&!origin)initGeometry();};
   video.addEventListener('loadedmetadata',init);video.addEventListener('resize',init);
   init();
   phase='idle';setUI();
@@ -198,7 +211,7 @@ const INSET=0.05;
 
 /* ---------- Coverage grid (best shot quality per cell) ---------- */
 const ck=(i,j)=>(i+20000)*40000+(j+20000);
-function cellsFor(px,py,sc,Q){
+function cellsFor(px,py,sc,Q,cm=cov,force=false){
   const hw=fw*sc*0.45,hh=fh*sc*0.45;
   const i0=Math.floor((px-hw)/cs),i1=Math.floor((px+hw)/cs),j0=Math.floor((py-hh)/cs),j1=Math.floor((py+hh)/cs);
   let n=0,nNew=0,nBet=0;const allow=[],all=[];
@@ -206,13 +219,13 @@ function cellsFor(px,py,sc,Q){
     const ux=(i+0.5)*cs,uy=(j+0.5)*cs;
     if(ux<px-hw||ux>px+hw||uy<py-hh||uy>py+hh)continue;
     n++;const k=ck(i,j);all.push(k);
-    const e=cov.get(k);
+    const e=cm.get(k);
     if(e===undefined){nNew++;allow.push([i,j]);}
-    else if(Q>e*1.15){allow.push([i,j]);if(Q>e*1.3)nBet++;}
+    else if(force||Q>e*1.15){allow.push([i,j]);if(!force&&Q>e*1.3)nBet++;}
   }
   return {n,nNew,nBet,allow,all};
 }
-function markCells(all,Q){for(const k of all){const e=cov.get(k);if(e===undefined||Q>e)cov.set(k,Q);}}
+function markCells(all,Q,cm=cov){for(const k of all){const e=cm.get(k);if(e===undefined||Q>e)cm.set(k,Q);}}
 
 /* ---------- Sparse tracking map (tiles of gray + valid) ---------- */
 const tk=(ti,tj)=>(ti+8192)*16384+(tj+8192);
@@ -311,23 +324,19 @@ const PH=20,PN=400;                 // patch is 40x40 sampled every 2px
 const ptx=new Int8Array(PN),pty=new Int8Array(PN);
 {let i=0;for(let y=-PH;y<PH;y+=2)for(let x=-PH;x<PH;x+=2){ptx[i]=x;pty[i]=y;i++;}}
 
-function createAnchors(){
-  anchors=[];
-  const names=['TL','TR','BL','BR'],sx=[-1,1,-1,1],sy=[-1,-1,1,1];
-  for(let k=0;k<4;k++){
-    const tx=Math.round(fw/2+sx[k]*0.3*fw),ty=Math.round(fh/2+sy[k]*0.3*fh);
-    let best=-1,bx=tx,by=ty;
-    for(let dy=-24;dy<=24;dy+=8)for(let dx=-24;dx<=24;dx+=8){   // pick the most textured spot nearby
-      const x=tx+dx,y=ty+dy;
-      if(x<PH+2||x>fw-PH-3||y<PH+2||y>fh-PH-3)continue;
-      let s=0,s2=0;
-      for(let i=0;i<PN;i++){const v=g[(y+pty[i])*fw+(x+ptx[i])];s+=v;s2+=v*v;}
-      const va=s2/PN-(s/PN)*(s/PN);if(va>best){best=va;bx=x;by=y;}
-    }
-    const pv=new Uint8Array(PN);
-    for(let i=0;i<PN;i++)pv[i]=g[(by+pty[i])*fw+(bx+ptx[i])];
-    anchors.push({name:names[k],gx:bx,gy:by,pv});   // first frame has centre (fw/2,fh/2) and scale 1, so global = frame pixels
+// place a corner exactly at the centre of the current view (where the on-screen target is); returns patch variance
+function addCorner(){
+  const pv=new Uint8Array(PN);let s=0,s2=0;
+  for(let i=0;i<PN;i++){                 // patch is sampled in global units, so it stays valid at any height
+    const x=Math.max(0,Math.min(fw-1,Math.round(fw/2+ptx[i]/smSc))),y=Math.max(0,Math.min(fh-1,Math.round(fh/2+pty[i]/smSc)));
+    const v=g[y*fw+x];pv[i]=v;s+=v;s2+=v*v;
   }
+  anchors.push({name:CORNER_NAMES[anchors.length],gx:cx,gy:cy,pv});
+  return s2/PN-(s/PN)*(s/PN);
+}
+function cornerHint(){
+  const n=anchors.length;
+  return n<4?'Corner '+(n+1)+' of 4: put the target on the '+CORNER_DESC[n]+' corner, then tap Place corner':'All 4 corners set. Tap Start scan';
 }
 // find anchor patch in the live gray image around (lx0,ly0)
 function matchAnchor(a,lx0,ly0,Rx,Ry,step,scs,pstep){
@@ -421,8 +430,10 @@ function process(dt){
   const fr=focus>0?Math.min(1,focus/focusRef):0;
   lastFr=fr;
   const m={mean,diff,fr,tex:e2};
+  lastM=m;
   tickN++;
-  if(!shots.length){armStep(m);drawOverlay();}
+  if(snapReq&&performance.now()>snapReq){endSnap();say(lost?'Snap failed: tracking lost':'Snap timed out: hold still so it can focus, then try again',3500);}
+  if(!origin){armStep(m);drawOverlay();}
   else{trackStep(m,dt);drawOverlay();}
   if(tickN%3===0)drawMM();
 }
@@ -438,23 +449,30 @@ function setRing(col,txt,a,b){ring.className=col;ringT.textContent=txt||'';l1.te
 
 function armStep(m){
   const q=quality(m);
-  if(phase==='idle'){setRing(q[0],'',q[0]==='green'?'Ready: tap Start scan':q[1],q[0]==='green'?'Frame the top-left corner of what you want to scan':q[2]);return;}
-  if(phase==='paused'){setRing(q[0],'',q[1],q[2]);return;}
-  armTicks++;if(q[0]==='green')armGood++;else armGood=0;
-  const okEnough=m.mean>=CFG.DARK&&m.tex>=CFG.TEX_MIN;
-  if(armGood>=3||(armTicks>=CFG.ARM_TICKS&&okEnough))anchor(m);
-  else setRing(q[0],'','Hold steady to begin',q[2]);
+  setRing(q[0],'',q[0]==='green'?'Ready':q[1],q[0]==='green'?'Put the target on the top-left corner, then tap Place corner 1':q[2]);
 }
 
-function anchor(m){
-  tiles=new Map();shots=[];cb=null;cov=new Map();
+// corner 1 sets the map origin; the tracking map is then painted (without storing shots) as you move to the other corners
+function placeFirstCorner(){
+  const m=lastM;if(!m||!g)return;
+  const q=quality(m);
+  if(q[0]==='red'){say(q[1]+': '+q[2]);return;}
+  tiles=new Map();shots=[];cb=null;cov=new Map();mcov=new Map();anchors=[];
   Hcm=parseFloat($('hcm').value)||Hcm;
-  cx=fw/2;cy=fh/2;vx=vy=0;smSc=1;lost=false;failN=0;speed=0;stableN=0;
-  createAnchors();
-  const Q=m.fr||1,c=cellsFor(cx,cy,1,Q);
-  takeShot(c,Q);
+  cx=fw/2;cy=fh/2;vx=vy=0;smSc=1;lost=false;failN=0;speed=0;stableN=0;lastScore=1;
+  const c=cellsFor(cx,cy,1,1,mcov);
+  paintLo(cx,cy,1,null);markCells(c.all,1,mcov);
+  const va=addCorner();
+  origin=true;phase='setup';
   flash();setUI();
-  say('Start points set. Now sweep slowly. If tracking is lost, return to the top-left START point.',5000);
+  say(va<4?'Little detail at this corner: it will work as a marker but cannot help recover lost tracking.':'Corner 1 (home) set. Move to the top-right corner at the same height.',4500);
+}
+function placeNextCorner(){
+  if(!origin||lost||failN>0||lastScore<0.55||!lastM){say('Wait until the ring is green (tracking), then place the corner.');return;}
+  if(lastM.fr<CFG.FOCUS_WARN){say('Out of focus: hold still, then place the corner.');return;}
+  const va=addCorner();
+  flash();setUI();
+  say(va<4?'Little detail at this corner: it is a marker only.':cornerHint(),3500);
 }
 
 // store a shot: paint the tracking map now, keep the full-res frame as a compressed JPEG for the final stitch
@@ -514,9 +532,23 @@ function trackStep(m,dt){
   else if(tooFast){col='yellow';a='Slow down';}
   else if(scaleOut){col='yellow';a=smSc<0.5?'Too close to start height':'Too far from start height';}
   else if(m.fr<CFG.FOCUS_OK){col='yellow';a='Refocusing…';}
-  else{col='green';a='Capturing';}
-  setRing(col,Math.round(smSc*100)+'%',a,'Height ≈ '+(Hcm*smSc).toFixed(0)+' cm · '+placed+' shots');
-  if(phase==='scanning'&&!tooFast&&!scaleOut&&m.fr>=CFG.FOCUS_OK&&stableN>=3&&lastScore>=0.55){
+  else{col='green';a=phase==='setup'?'Tracking':snapReq?'Snapping…':'Capturing';}
+  setRing(col,Math.round(smSc*100)+'%',a,phase==='setup'?cornerHint():'Height ≈ '+(Hcm*smSc).toFixed(0)+' cm · '+placed+' shots');
+  if(phase==='setup'){                      // map-only painting so tracking survives the walk between corners
+    if(!tooFast&&!scaleOut&&m.fr>=CFG.FOCUS_OK&&stableN>=3&&lastScore>=0.55){
+      const c=cellsFor(cx,cy,smSc,1,mcov);
+      if(c.n>0&&c.nNew/c.n>=CFG.GAIN){
+        const aset=c.allow.length===c.n?null:new Set(c.allow.map(q=>ck(q[0],q[1])));
+        paintLo(cx,cy,smSc,aset);markCells(c.all,1,mcov);
+      }
+    }
+    return;
+  }
+  if(phase==='scanning'&&snapReq&&speed/smSc<=CFG.SPEED*fw*1.8&&m.fr>=CFG.FOCUS_WARN&&stableN>=1&&lastScore>=0.5){
+    const Q=m.fr/smSc,c=cellsFor(cx,cy,smSc,Q,cov,true);   // forced shot: overlays everything it covers
+    takeShot(c,Q);flash();endSnap();say('Snapped',1500);
+  }
+  else if(phase==='scanning'&&!tooFast&&!scaleOut&&m.fr>=CFG.FOCUS_OK&&stableN>=3&&lastScore>=0.55){
     const Q=m.fr/smSc;                       // sharper and closer is better
     const c=cellsFor(cx,cy,smSc,Q);
     if(c.n>0&&(c.nNew+0.6*c.nBet)/c.n>=CFG.GAIN){takeShot(c,Q);flash();}
@@ -529,6 +561,14 @@ function drawOverlay(){
   if(!W||!H)return;
   if(ov.width!==W||ov.height!==H){ov.width=W;ov.height=H;}
   ovx.clearRect(0,0,W,H);
+  if((phase==='idle'||phase==='setup')&&anchors.length<4){      // aiming target for the next corner
+    const X=W/2,Y=H/2;
+    ovx.strokeStyle='#ffcc00';ovx.lineWidth=3;
+    ovx.beginPath();ovx.arc(X,Y,26,0,Math.PI*2);ovx.stroke();
+    ovx.beginPath();ovx.moveTo(X-40,Y);ovx.lineTo(X+40,Y);ovx.moveTo(X,Y-40);ovx.lineTo(X,Y+40);ovx.stroke();
+    ovx.fillStyle='#ffcc00';ovx.font='bold 14px -apple-system,sans-serif';ovx.textAlign='center';
+    ovx.fillText('Corner '+(anchors.length+1)+': '+CORNER_DESC[anchors.length],X,Y-50);
+  }
   if(!anchors.length||phase==='idle')return;
   const scr=Math.max(W/vw,H/vh),ox=(W-vw*scr)/2,oy=(H-vh*scr)/2,k=vw/fw*scr;
   if(lost){
@@ -541,14 +581,22 @@ function drawOverlay(){
     ovx.font='bold 15px -apple-system,sans-serif';ovx.textAlign='center';ovx.fillText('START',x1+ux*30,y1+uy*30);
     return;
   }
+  const pts=anchors.map(a=>[(fw/2+(a.gx-cx)/smSc)*k+ox,(fh/2+(a.gy-cy)/smSc)*k+oy]);
+  if(pts.length>1){                         // outline of the area
+    ovx.strokeStyle='rgba(255,255,255,.6)';ovx.lineWidth=2;ovx.setLineDash([8,6]);
+    ovx.beginPath();pts.forEach((p,i)=>i?ovx.lineTo(p[0],p[1]):ovx.moveTo(p[0],p[1]));
+    if(pts.length===4)ovx.closePath();
+    ovx.stroke();ovx.setLineDash([]);
+  }
   anchors.forEach((a,i)=>{
-    const lx=fw/2+(a.gx-cx)/smSc,ly=fh/2+(a.gy-cy)/smSc,X=lx*k+ox,Y=ly*k+oy;
+    const X=pts[i][0],Y=pts[i][1];
     if(X<-30||Y<-30||X>W+30||Y>H+30)return;
     const home=i===0,r=home?20:13;
     ovx.lineWidth=home?5:3;ovx.strokeStyle=home?'#34c759':'rgba(255,255,255,.85)';
     ovx.beginPath();ovx.arc(X,Y,r,0,Math.PI*2);ovx.stroke();
     ovx.beginPath();ovx.moveTo(X-r-5,Y);ovx.lineTo(X+r+5,Y);ovx.moveTo(X,Y-r-5);ovx.lineTo(X,Y+r+5);ovx.lineWidth=2;ovx.stroke();
-    if(home){ovx.fillStyle='#34c759';ovx.font='bold 14px -apple-system,sans-serif';ovx.textAlign='center';ovx.fillText('START',X,Y-r-10);}
+    ovx.fillStyle=home?'#34c759':'#fff';ovx.font='bold 14px -apple-system,sans-serif';ovx.textAlign='center';
+    ovx.fillText(home?'START':String(i+1),X,Y-r-10);
   });
 }
 
@@ -556,14 +604,22 @@ function drawOverlay(){
 function drawMM(){
   const w=mm.width,h=mm.height;
   mmx.fillStyle='#1c1c1e';mmx.fillRect(0,0,w,h);
-  if(!shots.length||!cb)return;
+  if(!origin)return;
   const fhw=fw*smSc/2,fhh=fh*smSc/2;
-  const x0=Math.min(cb.x0,cx-fhw),y0=Math.min(cb.y0,cy-fhh),x1=Math.max(cb.x1,cx+fhw),y1=Math.max(cb.y1,cy+fhh);
+  let x0=cx-fhw,y0=cy-fhh,x1=cx+fhw,y1=cy+fhh;
+  if(cb){x0=Math.min(x0,cb.x0);y0=Math.min(y0,cb.y0);x1=Math.max(x1,cb.x1);y1=Math.max(y1,cb.y1);}
+  for(const a of anchors){x0=Math.min(x0,a.gx-8);y0=Math.min(y0,a.gy-8);x1=Math.max(x1,a.gx+8);y1=Math.max(y1,a.gy+8);}
   const s=Math.min((w-6)/(x1-x0),(h-6)/(y1-y0));
   const tx=(x)=>3+(x-x0)*s,ty=(y)=>3+(y-y0)*s;
   for(const sh of shots){
     const hw=fw*sh.sc*(0.5-INSET),hh=fh*sh.sc*(0.5-INSET),t=sh.th;
     mmx.drawImage(t,t.width*INSET,t.height*INSET,t.width*(1-2*INSET),t.height*(1-2*INSET),tx(sh.x-hw),ty(sh.y-hh),2*hw*s,2*hh*s);
+  }
+  if(anchors.length>1){
+    mmx.strokeStyle='rgba(255,255,255,.7)';mmx.lineWidth=1;mmx.setLineDash([4,3]);
+    mmx.beginPath();anchors.forEach((a,i)=>i?mmx.lineTo(tx(a.gx),ty(a.gy)):mmx.moveTo(tx(a.gx),ty(a.gy)));
+    if(anchors.length===4)mmx.closePath();
+    mmx.stroke();mmx.setLineDash([]);
   }
   anchors.forEach((a,i)=>{mmx.fillStyle=i===0?'#34c759':'#fff';mmx.beginPath();mmx.arc(tx(a.gx),ty(a.gy),i===0?5:3,0,Math.PI*2);mmx.fill();});
   mmx.strokeStyle=lost?'#ff3b30':'#34c759';mmx.lineWidth=2;
@@ -571,27 +627,50 @@ function drawMM(){
 }
 function updateInfo(){
   if(cb)$('mmInfo').textContent=shots.length+' shots · '+Math.round((cb.x1-cb.x0)*P0)+'×'+Math.round((cb.y1-cb.y0)*P0);
-  else $('mmInfo').textContent='map';
-  bFinish.hidden=!shots.length;bReset.hidden=!shots.length;bFinish.textContent='Finish ('+shots.length+')';
+  else $('mmInfo').textContent=origin?'corners '+anchors.length+'/4':'map';
+  bFinish.hidden=!shots.length;bReset.hidden=!origin;bFinish.textContent='Finish ('+shots.length+')';
+  bUndo.hidden=!(phase==='setup'&&anchors.length>=1);
+  bSnap.hidden=phase!=='scanning';
+  row2.hidden=[bFinish,bUndo,bTorch,bReset].every(b=>b.hidden);
 }
 
 /* ---------- UI / buttons ---------- */
 function setUI(){
-  if(phase==='idle'){bMain.textContent='Start scan';bMain.className='go';}
+  if(phase==='idle'){bMain.textContent='Place corner 1 · '+CORNER_DESC[0];bMain.className='go';}
+  else if(phase==='setup'){
+    if(anchors.length<4){bMain.textContent='Place corner '+(anchors.length+1)+' · '+CORNER_DESC[anchors.length];bMain.className='';}
+    else{bMain.textContent='Start scan';bMain.className='go';}
+  }
   else if(phase==='scanning'){bMain.textContent='Pause';bMain.className='';}
   else if(phase==='paused'){bMain.textContent='Resume';bMain.className='go';}
   bFinish.className=shots.length?'go':'';
   updateInfo();
 }
+function endSnap(){snapReq=0;bSnap.textContent='Snap now';bSnap.disabled=false;}
+bSnap.onclick=()=>{
+  if(phase!=='scanning'||snapReq)return;
+  if(lost){say('Tracking is lost: return to the START point first.');return;}
+  snapReq=performance.now()+3500;bSnap.textContent='Snapping…';bSnap.disabled=true;
+  say('Hold still: taking a picture as soon as it is sharp',2500);
+};
 bMain.onclick=()=>{
-  if(phase==='idle'){phase='scanning';armGood=0;armTicks=0;say('Hold steady a moment, with the top-left of your area in view.',3500);}
-  else if(phase==='scanning')phase='paused';
-  else if(phase==='paused'){phase='scanning';armGood=0;armTicks=0;}
+  if(phase==='idle')placeFirstCorner();
+  else if(phase==='setup'){
+    if(anchors.length<4)placeNextCorner();
+    else{phase='scanning';say('Scanning. Sweep slowly. If tracking is lost, return to the START corner.',4500);}
+  }
+  else if(phase==='scanning'){phase='paused';endSnap();}
+  else if(phase==='paused'){phase='scanning';}
   setUI();
 };
-bReset.onclick=()=>{if(confirm('Discard this scan and start over?'))resetAll();};
+bUndo.onclick=()=>{
+  if(anchors.length>1){anchors.pop();setUI();drawOverlay();drawMM();say('Last corner removed.',2000);}
+  else resetAll();
+};
+bReset.onclick=()=>{if(!shots.length||confirm('Discard this scan and start over?'))resetAll();};
 function resetAll(){
-  tiles=new Map();shots=[];anchors=[];cb=null;cov=new Map();rawOut=null;placed=0;stableN=0;failN=0;
+  tiles=new Map();shots=[];anchors=[];cb=null;cov=new Map();mcov=new Map();rawOut=null;placed=0;stableN=0;failN=0;
+  origin=false;endSnap();
   phase='idle';lost=false;armGood=0;armTicks=0;focusRef=1e-6;smSc=1;
   show('scan');setUI();drawMM();drawOverlay();
 }
